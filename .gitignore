@@ -405,5 +405,5 @@ FodyWeavers.xsd
 # Remove appsettings.json
 appsettings.json
 
-# Generated output directories
+# Generated output and sample directories
 sample/output/
