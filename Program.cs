@@ -9,6 +9,13 @@ using genslation.Models;
 
 var services = new ServiceCollection();
 
+// Ensure logs directory exists
+var logsDir = Path.GetDirectoryName("logs/genslation-.log");
+if (!string.IsNullOrEmpty(logsDir))
+{
+    Directory.CreateDirectory(logsDir);
+}
+
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -71,7 +78,10 @@ services.AddSingleton<ITranslationProvider>(sp =>
             {
                 MaxTokensPerRequest = settings.TranslationProvider.MaxTokensPerRequest,
                 MaxRetries = settings.TranslationProvider.MaxRetries,
-                RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds)
+                RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds),
+                EnableTranslationMemory = false,  // Force disable translation memory
+                Temperature = settings.TranslationProvider.Temperature,
+                TopP = settings.TranslationProvider.TopP
             });
     }
     else
@@ -85,7 +95,10 @@ services.AddSingleton<ITranslationProvider>(sp =>
             {
                 MaxTokensPerRequest = settings.TranslationProvider.MaxTokensPerRequest,
                 MaxRetries = settings.TranslationProvider.MaxRetries,
-                RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds)
+                RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds),
+                EnableTranslationMemory = false,  // Force disable translation memory
+                Temperature = settings.TranslationProvider.Temperature,
+                TopP = settings.TranslationProvider.TopP
             });
     }
 });
@@ -96,8 +109,10 @@ services.AddSingleton(new TranslationOptions
     MaxTokensPerRequest = configService.Settings.TranslationProvider.MaxTokensPerRequest,
     MaxRetries = configService.Settings.TranslationProvider.MaxRetries,
     RetryDelay = TimeSpan.FromMilliseconds(configService.Settings.TranslationProvider.RetryDelayMilliseconds),
-    EnableTranslationMemory = configService.Settings.TranslationMemory.Enabled,
-    PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting
+    EnableTranslationMemory = false,  // Force disable translation memory
+    PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting,
+    Temperature = configService.Settings.TranslationProvider.Temperature,
+    TopP = configService.Settings.TranslationProvider.TopP
 });
 
 services.AddSingleton<TranslationService>();
@@ -121,6 +136,13 @@ try
     var sourceLang = args[2];
     var targetLang = args.Length > 3 ? args[3] : "zh";
 
+    // Ensure output directory exists
+    var outputDir = Path.GetDirectoryName(outputFile);
+    if (!string.IsNullOrEmpty(outputDir))
+    {
+        Directory.CreateDirectory(outputDir);
+    }
+
     // Load the ePub
     logger.LogInformation("Loading ePub: {InputFile}", inputFile);
     var document = await epubProcessor.LoadAsync(inputFile);
@@ -133,8 +155,10 @@ try
         { 
             SourceLanguage = sourceLang,
             TargetLanguage = targetLang,
-            EnableTranslationMemory = configService.Settings.TranslationMemory.Enabled,
-            MaxTokensPerRequest = configService.Settings.TranslationProvider.MaxTokensPerRequest
+            EnableTranslationMemory = false,  // Force disable translation memory
+            MaxTokensPerRequest = configService.Settings.TranslationProvider.MaxTokensPerRequest,
+            Temperature = configService.Settings.TranslationProvider.Temperature,
+            TopP = configService.Settings.TranslationProvider.TopP
         });
 
     // Save the translated ePub
@@ -144,7 +168,8 @@ try
         outputFile,
         new TranslationOptions
         {
-            PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting
+            PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting,
+            EnableTranslationMemory = false  // Force disable translation memory
         });
 
     if (success)

@@ -40,52 +40,100 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
         try
         {
             var stopwatch = Stopwatch.StartNew();
+            var estimatedTokens = await EstimateTokenCount(text);
+            
+            _logger.LogInformation(
+                "Starting translation: Source={SourceLang}, Target={TargetLang}, Tokens={Tokens}, Model={Model}",
+                sourceLanguage,
+                targetLanguage,
+                estimatedTokens,
+                _deploymentName);
+
             var result = new TranslationResult
             {
                 OriginalContent = text,
                 Metrics = new TranslationMetrics
                 {
                     Provider = Name,
-                    TokenCount = await EstimateTokenCount(text)
+                    TokenCount = estimatedTokens
                 }
             };
 
             if (string.IsNullOrWhiteSpace(text))
             {
+                _logger.LogWarning("Empty text provided for translation");
                 return CreateErrorResult(text, "Empty text provided");
             }
 
             var chunks = await SplitIntoChunks(text, options.MaxTokensPerRequest);
+            _logger.LogInformation("Split text into {ChunkCount} chunks", chunks.Count);
+            
             var translatedChunks = new List<string>();
+            var chunkIndex = 0;
 
             foreach (var chunk in chunks)
             {
+                chunkIndex++;
+                var chunkStopwatch = Stopwatch.StartNew();
                 var prompt = CreateTranslationPrompt(chunk, sourceLanguage, targetLanguage, options);
                 
                 try
                 {
-                    var promptExecutionSettings = new OpenAIPromptExecutionSettings 
+                    _logger.LogTrace(
+                        "Translating chunk {Index}/{Total}: Length={Length}, Text={Text}",
+                        chunkIndex,
+                        chunks.Count,
+                        chunk.Length,
+                        chunk.Length > 50 ? chunk.Substring(0, 50) + "..." : chunk);
+
+                    var promptExecutionSettings = new OpenAIPromptExecutionSettings
                     {
                         MaxTokens = 2000,
-                        Temperature = 0.3,
-                        TopP = 0.95,
+                        Temperature = options.Temperature ?? 0.3,
+                        TopP = options.TopP ?? 0.95,
                         ChatSystemPrompt = "You are a professional translator specialized in technical content."
                     };
+
+                    _logger.LogDebug(
+                        "API Request: Model={Model}, MaxTokens={MaxTokens}, Temperature={Temperature}, TopP={TopP}",
+                        _deploymentName,
+                        promptExecutionSettings.MaxTokens,
+                        promptExecutionSettings.Temperature,
+                        promptExecutionSettings.TopP);
 
                     var function = _kernel.CreateFunctionFromPrompt(prompt, promptExecutionSettings);
                     var functionResult = await _kernel.InvokeAsync(function, new KernelArguments());
 
                     if (functionResult.Metadata.ContainsKey("Error"))
                     {
-                        _logger.LogError("Translation error for chunk: {Error}", functionResult.Metadata["Error"]);
-                        return CreateErrorResult(text, $"Translation failed: {functionResult.Metadata["Error"]}");
+                        var error = functionResult.Metadata["Error"];
+                        _logger.LogError(
+                            "Translation error for chunk {Index}: {Error}, Text={Text}",
+                            chunkIndex,
+                            error,
+                            chunk);
+                        return CreateErrorResult(text, $"Translation failed: {error}");
                     }
 
-                    translatedChunks.Add(functionResult.GetValue<string>() ?? string.Empty);
+                    var translatedText = functionResult.GetValue<string>() ?? string.Empty;
+                    translatedChunks.Add(translatedText);
+
+                    chunkStopwatch.Stop();
+                    _logger.LogInformation(
+                        "Chunk {Index}/{Total} translated successfully in {Duration}ms",
+                        chunkIndex,
+                        chunks.Count,
+                        chunkStopwatch.ElapsedMilliseconds);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to translate chunk");
+                    _logger.LogError(
+                        ex,
+                        "Failed to translate chunk {Index}/{Total}: {Error}, Text={Text}",
+                        chunkIndex,
+                        chunks.Count,
+                        ex.Message,
+                        chunk);
                     return CreateErrorResult(text, $"Translation failed: {ex.Message}");
                 }
             }
@@ -94,6 +142,12 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
             result.TranslatedContent = string.Join("", translatedChunks);
             result.Success = true;
             result.Metrics.ProcessingTime = stopwatch.Elapsed;
+
+            _logger.LogInformation(
+                "Translation completed: Chunks={Chunks}, TotalTime={Duration}ms, AverageChunkTime={AverageTime}ms",
+                chunks.Count,
+                stopwatch.ElapsedMilliseconds,
+                stopwatch.ElapsedMilliseconds / chunks.Count);
 
             return result;
         }

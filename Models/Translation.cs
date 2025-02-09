@@ -12,6 +12,8 @@ public class TranslationOptions
     public bool PreserveFormatting { get; set; } = true;
     public QualityCheckLevel QualityCheckLevel { get; set; } = QualityCheckLevel.Standard;
     public Dictionary<string, string> CustomTerminology { get; set; } = new();
+    public double? Temperature { get; set; } = 0.3;
+    public double? TopP { get; set; } = 0.95;
 }
 
 public class TranslationResult

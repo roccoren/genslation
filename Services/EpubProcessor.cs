@@ -1,73 +1,335 @@
-namespace genslation.Services;
-
-using System.Text.RegularExpressions;
-using System.Linq;
+using System;
+using System.Collections.Generic;
+using System.IO;
 using System.IO.Compression;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using genslation.Interfaces;
 using genslation.Models;
 using HtmlAgilityPack;
 using Microsoft.Extensions.Logging;
 using VersOne.Epub;
-using VersOne.Epub.Schema;
 
-public class EpubProcessor : IEpubProcessor
+namespace genslation.Services
 {
-    private readonly ILogger<EpubProcessor> _logger;
-    private static readonly Regex HtmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
-    private static readonly Regex WhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
-
-    public EpubProcessor(ILogger<EpubProcessor> logger)
+    public class EpubProcessor : IEpubProcessor
     {
-        _logger = logger;
-    }
+        private readonly ILogger<EpubProcessor> _logger;
 
-    public async Task<EpubDocument> LoadAsync(string filePath)
-    {
-        try
+        public EpubProcessor(ILogger<EpubProcessor> logger)
         {
-            var book = await EpubReader.ReadBookAsync(filePath);
-            var document = new EpubDocument
+            _logger = logger;
+        }
+
+        public async Task<List<EpubChapter>> ExtractChaptersAsync(EpubDocument document)
+        {
+            var book = await EpubReader.ReadBookAsync(document.FilePath);
+            return await LoadChaptersAsync(book);
+        }
+
+        public async Task<EpubDocument> LoadAsync(string filePath)
+        {
+            try
             {
-                Title = GetFirstMetadataValue(book.Schema.Package.Metadata.Titles),
-                Author = string.Join("; ", GetMetadataValues(book.Schema.Package.Metadata.Creators)),
-                Language = GetFirstMetadataValue(book.Schema.Package.Metadata.Languages),
-                FilePath = filePath
-            };
-
-            var chapters = await LoadChaptersAsync(book);
-            document.Chapters.AddRange(chapters);
-            document.Metadata = await ExtractMetadataAsync(filePath);
-            
-            return document;
+                var book = await EpubReader.ReadBookAsync(filePath);
+                var document = new EpubDocument
+                {
+                    Title = book.Title,
+                    Author = string.Join("; ", book.AuthorList),
+                    Language = book.Schema.Package.Metadata.Languages.FirstOrDefault()?.ToString() ?? string.Empty,
+                    FilePath = filePath,
+                    CoverImage = book.CoverImage,
+                    TableOfContents = MapNavigationItems(book.Navigation),
+                    Resources = await ExtractResourcesAsync(book),
+                    Chapters = await LoadChaptersAsync(book)
+                };
+                return document;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load EPUB file: {FilePath}", filePath);
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        private List<genslation.Models.EpubNavigationItem> MapNavigationItems(IReadOnlyList<VersOne.Epub.EpubNavigationItem> navigationItems)
         {
-            _logger.LogError(ex, "Failed to load ePub file: {FilePath}", filePath);
-            throw;
+            var result = new List<genslation.Models.EpubNavigationItem>();
+            foreach (var item in navigationItems)
+            {
+                result.Add(new genslation.Models.EpubNavigationItem
+                {
+                    Title = item.Title,
+                    Source = item.Link?.ContentFilePath ?? string.Empty,
+                    Children = MapNavigationItems(item.NestedItems)
+                });
+            }
+            return result;
         }
-    }
 
-    private string GetFirstMetadataValue<T>(IReadOnlyList<T> items) where T : class
-    {
-        if (items == null || !items.Any())
-            return string.Empty;
+        private List<EpubResource> MapResources(EpubContent content)
+        {
+            var resources = new List<EpubResource>();
 
-        var item = items.FirstOrDefault();
-        return item?.ToString() ?? string.Empty;
-    }
+            if (content.Html?.Local != null)
+            {
+                foreach (var file in content.Html.Local)
+                {
+                    resources.Add(new EpubResource
+                    {
+                        Path = file.FilePath,
+                        Data = Encoding.UTF8.GetBytes(file.Content),
+                        MimeType = file.ContentMimeType,
+                        Type = ResourceType.Other
+                    });
+                }
+            }
 
-    private IEnumerable<string> GetMetadataValues<T>(IReadOnlyList<T> items) where T : class
-    {
-        if (items == null)
-            return Enumerable.Empty<string>();
+            if (content.Images?.Local != null)
+            {
+                foreach (var file in content.Images.Local)
+                {
+                    var byteFile = file as EpubLocalByteContentFile;
+                    if (byteFile != null)
+                    {
+                        resources.Add(new EpubResource
+                        {
+                            Path = file.FilePath,
+                            Data = byteFile.Content,
+                            MimeType = file.ContentMimeType,
+                            Type = ResourceType.Image
+                        });
+                    }
+                }
+            }
 
-        return items.Select(i => i?.ToString() ?? string.Empty)
-                   .Where(s => !string.IsNullOrWhiteSpace(s));
-    }
+            if (content.Css?.Local != null)
+            {
+                foreach (var file in content.Css.Local)
+                {
+                    resources.Add(new EpubResource
+                    {
+                        Path = file.FilePath,
+                        Data = Encoding.UTF8.GetBytes(file.Content),
+                        MimeType = file.ContentMimeType,
+                        Type = ResourceType.Stylesheet
+                    });
+                }
+            }
 
-    public async Task<bool> ValidateStructureAsync(EpubDocument document)
-    {
-        try
+            return resources;
+        }
+
+        private ResourceType DetermineResourceType(string filePath)
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+            return extension switch
+            {
+                ".jpg" or ".jpeg" or ".png" or ".gif" or ".svg" => ResourceType.Image,
+                ".ttf" or ".otf" or ".woff" or ".woff2" => ResourceType.Font,
+                ".css" => ResourceType.Stylesheet,
+                _ => ResourceType.Other
+            };
+        }
+
+        public async Task<bool> SaveTranslatedEpubAsync(EpubDocument originalDocument, string outputPath, TranslationOptions options)
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            Directory.CreateDirectory(tempDir);
+
+            try
+            {
+                // Extract original EPUB to temp directory
+                ZipFile.ExtractToDirectory(originalDocument.FilePath, tempDir);
+
+                // Update chapters with translations
+                foreach (var chapter in originalDocument.Chapters)
+                {
+                    var chapterPath = Path.Combine(tempDir, chapter.OriginalPath);
+                    if (File.Exists(chapterPath))
+                    {
+                        var translatedContent = RebuildChapterContent(chapter);
+                        await File.WriteAllTextAsync(chapterPath, translatedContent);
+                    }
+                }
+
+                // Update metadata
+                var contentOpfPath = Path.Combine(tempDir, "content.opf");
+                if (File.Exists(contentOpfPath))
+                {
+                    var content = await File.ReadAllTextAsync(contentOpfPath);
+                    content = Regex.Replace(content, @"<dc:language>[^<]+</dc:language>", $"<dc:language>{options.TargetLanguage}</dc:language>");
+                    await File.WriteAllTextAsync(contentOpfPath, content);
+                }
+
+                // Save cover image
+                if (originalDocument.CoverImage != null)
+                {
+                    var coverPath = Path.Combine(tempDir, "cover.jpg");
+                    await File.WriteAllBytesAsync(coverPath, originalDocument.CoverImage);
+                }
+
+                // Create output EPUB
+                if (File.Exists(outputPath))
+                {
+                    File.Delete(outputPath);
+                }
+                ZipFile.CreateFromDirectory(tempDir, outputPath);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save translated EPUB.");
+                return false;
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        private async Task<List<EpubResource>> ExtractResourcesAsync(EpubBook book)
+        {
+            var resources = new List<EpubResource>();
+            
+            // Extract HTML content
+            foreach (var htmlFile in book.Content.Html.Local)
+            {
+                resources.Add(new EpubResource
+                {
+                    Id = Path.GetFileNameWithoutExtension(htmlFile.FilePath),
+                    Path = htmlFile.FilePath,
+                    Data = Encoding.UTF8.GetBytes(htmlFile.Content),
+                    MimeType = "text/html",
+                    Type = ResourceType.Other
+                });
+            }
+            
+            // Extract images
+            foreach (var imageFile in book.Content.Images.Local)
+            {
+                resources.Add(new EpubResource
+                {
+                    Id = Path.GetFileNameWithoutExtension(imageFile.FilePath),
+                    Path = imageFile.FilePath,
+                    Data = ((EpubLocalByteContentFile)imageFile).Content,
+                    MimeType = imageFile.ContentMimeType,
+                    Type = ResourceType.Image
+                });
+            }
+            
+            // Extract CSS
+            foreach (var cssFile in book.Content.Css.Local)
+            {
+                resources.Add(new EpubResource
+                {
+                    Id = Path.GetFileNameWithoutExtension(cssFile.FilePath),
+                    Path = cssFile.FilePath,
+                    Data = Encoding.UTF8.GetBytes(cssFile.Content),
+                    MimeType = "text/css",
+                    Type = ResourceType.Stylesheet
+                });
+            }
+            
+            return resources;
+        }
+
+        private async Task<List<EpubChapter>> LoadChaptersAsync(EpubBook book)
+        {
+            var chapters = new List<EpubChapter>();
+            foreach (var item in book.ReadingOrder)
+            {
+                chapters.Add(new EpubChapter
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    Title = Path.GetFileNameWithoutExtension(item.FilePath),
+                    OriginalPath = item.FilePath,
+                    Paragraphs = ParseParagraphs(item.Content)
+                });
+            }
+            return chapters;
+        }
+
+        private List<EpubParagraph> ParseParagraphs(string htmlContent)
+        {
+            var paragraphs = new List<EpubParagraph>();
+            var doc = new HtmlDocument();
+            doc.LoadHtml(htmlContent);
+
+            var textNodes = doc.DocumentNode.SelectNodes("//p|//h1|//h2|//h3|//h4|//h5|//h6|//div[normalize-space()]");
+            
+            if (textNodes == null) return paragraphs;
+
+            foreach (var node in textNodes)
+            {
+                if (string.IsNullOrWhiteSpace(node.InnerText)) continue;
+
+                var type = node.Name.ToLower() switch
+                {
+                    "h1" => ParagraphType.Heading1,
+                    "h2" => ParagraphType.Heading2,
+                    "h3" => ParagraphType.Heading3,
+                    "h4" => ParagraphType.Heading4,
+                    "h5" => ParagraphType.Heading5,
+                    "h6" => ParagraphType.Heading6,
+                    _ => ParagraphType.Text
+                };
+
+                paragraphs.Add(new EpubParagraph
+                {
+                    Content = node.InnerText.Trim(),
+                    OriginalHtml = node.OuterHtml,
+                    Type = type
+                });
+            }
+
+            return paragraphs;
+        }
+
+        private string RebuildChapterContent(EpubChapter chapter)
+        {
+            var content = new StringBuilder();
+            content.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+            content.AppendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\">");
+            content.AppendLine("<head>");
+            content.AppendLine($"<title>{chapter.Title}</title>");
+            content.AppendLine("</head>");
+            content.AppendLine("<body>");
+            foreach (var paragraph in chapter.Paragraphs)
+            {
+                content.AppendLine($"<p>{paragraph.TranslatedContent ?? paragraph.Content}</p>");
+            }
+            content.AppendLine("</body>");
+            content.AppendLine("</html>");
+            return content.ToString();
+        }
+
+        public async Task<Dictionary<string, string>> ExtractMetadataAsync(string filePath)
+        {
+            try
+            {
+                var book = await EpubReader.ReadBookAsync(filePath);
+                return new Dictionary<string, string>
+                {
+                    { "Title", book.Title },
+                    { "Author", string.Join("; ", book.AuthorList) },
+                    { "Language", book.Schema.Package.Metadata.Languages.FirstOrDefault()?.ToString() ?? string.Empty }
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to extract metadata.");
+                throw;
+            }
+        }
+
+        public async Task<bool> ValidateStructureAsync(EpubDocument document)
         {
             if (string.IsNullOrEmpty(document.FilePath) || !File.Exists(document.FilePath))
             {
@@ -75,422 +337,35 @@ public class EpubProcessor : IEpubProcessor
                 return false;
             }
 
-            var book = await EpubReader.ReadBookAsync(document.FilePath);
-            var chapters = await LoadChaptersAsync(book);
-
-            if (!chapters.Any())
+            if (!document.Chapters.Any())
             {
-                _logger.LogError("No chapters found in ePub");
+                _logger.LogError("No chapters found in EPUB document.");
                 return false;
             }
 
-            // Check for required metadata
-            var metadata = book.Schema.Package.Metadata;
-            if (!metadata.Titles.Any() || !metadata.Creators.Any())
+            return true;
+        }
+
+        public async Task<bool> ValidateOutputAsync(string filePath)
+        {
+            if (!File.Exists(filePath))
             {
-                _logger.LogWarning("Missing essential metadata (title or creators)");
+                _logger.LogError("Output file does not exist: {FilePath}", filePath);
+                return false;
             }
 
             return true;
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Structure validation failed");
-            return false;
-        }
-    }
 
-    public async Task<List<Models.EpubChapter>> ExtractChaptersAsync(EpubDocument document)
-    {
-        try
-        {
-            var book = await EpubReader.ReadBookAsync(document.FilePath);
-            return await LoadChaptersAsync(book);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to extract chapters");
-            throw;
-        }
-    }
-
-    private async Task<List<Models.EpubChapter>> LoadChaptersAsync(EpubBook book)
-    {
-        if (book == null)
-        {
-            throw new ArgumentNullException(nameof(book));
-        }
-
-        if (string.IsNullOrEmpty(book.FilePath))
-        {
-            throw new ArgumentException("Book file path is null or empty", nameof(book));
-        }
-
-        _logger.LogDebug("Starting to load chapters from epub: {FilePath}", book.FilePath);
-        var chapters = new List<Models.EpubChapter>();
-        var tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-
-        try
-        {
-            _logger.LogDebug("Creating temporary directory: {TempDir}", tempDir);
-            Directory.CreateDirectory(tempDir);
-            
-            _logger.LogDebug("Extracting epub to temporary directory");
-            System.IO.Compression.ZipFile.ExtractToDirectory(book.FilePath, tempDir);
-            _logger.LogDebug("Successfully extracted epub contents");
-
-            foreach (var readingItem in book.ReadingOrder)
-            {
-                try
-                {
-                    if (readingItem == null)
-                    {
-                        _logger.LogWarning("Skipping null reading item");
-                        continue;
-                    }
-
-                    _logger.LogInformation("Processing content file: {FilePath}", readingItem.FilePath);
-                    _logger.LogDebug("Reading item details - FilePath: {FilePath}", readingItem.FilePath);
-
-                    var relativePath = readingItem.FilePath?.TrimStart('/') ?? string.Empty;
-                    if (string.IsNullOrEmpty(relativePath))
-                    {
-                        _logger.LogWarning("Skipping reading item with empty path");
-                        continue;
-                    }
-
-                    var possiblePaths = new[]
-                    {
-                        Path.Combine(tempDir, relativePath),
-                        Path.Combine(tempDir, "EPUB", relativePath),
-                        Path.Combine(tempDir, "OPS", relativePath),
-                        Path.Combine(tempDir, "OEBPS", relativePath)
-                    };
-
-                    string? content = null;
-                    foreach (var path in possiblePaths)
-                    {
-                        _logger.LogDebug("Checking path: {Path}", path);
-                        if (File.Exists(path))
-                        {
-                            _logger.LogInformation("Found content at: {Path}", path);
-                            content = await File.ReadAllTextAsync(path);
-                            break;
-                        }
-                    }
-
-                    if (!string.IsNullOrEmpty(content))
-                    {
-                        _logger.LogDebug("Processing content with length: {Length}", content.Length);
-                        var title = ExtractTitle(content);
-                        _logger.LogDebug("Extracted title: {Title}", title);
-
-                        var paragraphs = ExtractParagraphs(content);
-                        _logger.LogDebug("Extracted {Count} paragraphs", paragraphs.Count);
-
-                        var epubChapter = new Models.EpubChapter
-                        {
-                            Id = readingItem.FilePath,
-                            Title = title,
-                            Paragraphs = paragraphs
-                        };
-                        chapters.Add(epubChapter);
-                        _logger.LogInformation("Successfully processed chapter: {ChapterId}", epubChapter.Id);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Could not find or read content for: {FilePath}", readingItem.FilePath);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to process content file: {FilePath}", readingItem.FilePath);
-                }
-            }
-
-            _logger.LogDebug("Completed processing {Count} chapters", chapters.Count);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to process chapters");
-            throw;
-        }
-        finally
-        {
-            try
-            {
-                if (Directory.Exists(tempDir))
-                {
-                    _logger.LogDebug("Cleaning up temporary directory: {TempDir}", tempDir);
-                    Directory.Delete(tempDir, true);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to clean up temporary directory: {TempDir}", tempDir);
-            }
-        }
-
-        return chapters;
-    }
-
-    public async Task<bool> SaveTranslatedEpubAsync(
-        EpubDocument originalDocument,
-        string outputPath,
-        TranslationOptions options)
-    {
-        ArgumentNullException.ThrowIfNull(originalDocument);
-        ArgumentException.ThrowIfNullOrEmpty(outputPath);
-        ArgumentNullException.ThrowIfNull(options);
-
-        var tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        try
-        {
-            _logger.LogDebug("Creating temporary directory for epub modification: {TempDir}", tempDir);
-            Directory.CreateDirectory(tempDir);
-
-            // Extract the original epub
-            _logger.LogDebug("Extracting original epub to temp directory");
-            ZipFile.ExtractToDirectory(originalDocument.FilePath, tempDir);
-
-            // Update content files with translations
-            foreach (var chapter in originalDocument.Chapters)
-            {
-                try
-                {
-                    var chapterPath = Path.Combine(tempDir, chapter.Id);
-                    if (File.Exists(chapterPath))
-                    {
-                        _logger.LogDebug("Updating translated content for chapter: {ChapterId}", chapter.Id);
-                        var translatedContent = RebuildChapterContent(chapter);
-                        await File.WriteAllTextAsync(chapterPath, translatedContent);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to update chapter: {ChapterId}", chapter.Id);
-                }
-            }
-
-            // Update language in content.opf if exists
-            var contentOpfPath = Path.Combine(tempDir, "EPUB", "content.opf");
-            if (File.Exists(contentOpfPath))
-            {
-                _logger.LogDebug("Updating content.opf with target language");
-                var content = await File.ReadAllTextAsync(contentOpfPath);
-                content = Regex.Replace(content,
-                    @"<dc:language>[^<]+</dc:language>",
-                    $"<dc:language>{options.TargetLanguage}</dc:language>");
-                await File.WriteAllTextAsync(contentOpfPath, content);
-            }
-
-            // Create new epub file
-            _logger.LogDebug("Creating new epub file with translated content");
-            if (File.Exists(outputPath))
-            {
-                File.Delete(outputPath);
-            }
-            ZipFile.CreateFromDirectory(tempDir, outputPath);
-
-            _logger.LogInformation("Successfully saved translated epub to: {OutputPath}", outputPath);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to save translated ePub");
-            return false;
-        }
-        finally
-        {
-            try
-            {
-                if (Directory.Exists(tempDir))
-                {
-                    _logger.LogDebug("Cleaning up temporary directory");
-                    Directory.Delete(tempDir, true);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to clean up temporary directory: {TempDir}", tempDir);
-            }
-        }
-    }
-
-    public async Task<Dictionary<string, string>> ExtractMetadataAsync(string filePath)
-    {
-        try
-        {
-            var book = await EpubReader.ReadBookAsync(filePath);
-            var metadata = book.Schema.Package.Metadata;
-            
-            var result = new Dictionary<string, string>
-            {
-                { "title", GetFirstMetadataValue(metadata.Titles) },
-                { "language", GetFirstMetadataValue(metadata.Languages) },
-                { "author", string.Join("; ", GetMetadataValues(metadata.Creators)) },
-                { "publisher", string.Empty }, // Publisher not directly accessible in current version
-                { "description", string.Join(Environment.NewLine, GetMetadataValues(metadata.Descriptions)) }
-            };
-
-            return result;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to extract metadata");
-            throw;
-        }
-    }
-
-    public async Task<bool> ValidateOutputAsync(string filePath)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(filePath);
-
-        try
-        {
-            _logger.LogDebug("Validating output file: {FilePath}", filePath);
-            var book = await EpubReader.ReadBookAsync(filePath);
-            var hasContent = book.ReadingOrder.Any();
-            _logger.LogDebug("Output validation result: {HasContent}", hasContent);
-            return hasContent;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Output validation failed for: {FilePath}", filePath);
-            return false;
-        }
-    }
-
-    public async Task<byte[]> GeneratePreviewAsync(EpubDocument document, int chapterIndex = 0)
-    {
-        try
+        public async Task<byte[]> GeneratePreviewAsync(EpubDocument document, int chapterIndex = 0)
         {
             if (chapterIndex >= document.Chapters.Count)
             {
-                throw new ArgumentException("Invalid chapter index");
+                throw new ArgumentException("Invalid chapter index.");
             }
 
             var chapter = document.Chapters[chapterIndex];
-            var html = RebuildChapterContent(chapter);
-            return System.Text.Encoding.UTF8.GetBytes(html);
+            return Encoding.UTF8.GetBytes(RebuildChapterContent(chapter));
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to generate preview");
-            throw;
-        }
-    }
-
-    private List<Models.EpubParagraph> ExtractParagraphs(string content)
-    {
-        ArgumentNullException.ThrowIfNull(content);
-        
-        var paragraphs = new List<Models.EpubParagraph>();
-        var doc = new HtmlDocument();
-        doc.LoadHtml(content);
-
-        var nodes = doc.DocumentNode.SelectNodes("//p|//h1|//h2|//h3|//h4|//h5|//h6|//blockquote|//pre|//table");
-        if (nodes != null)
-        {
-            foreach (var node in nodes)
-            {
-                var type = DetermineNodeType(node);
-                var text = node.InnerText.Trim();
-                
-                if (!string.IsNullOrWhiteSpace(text))
-                {
-                    paragraphs.Add(new Models.EpubParagraph
-                    {
-                        Id = Guid.NewGuid().ToString(),
-                        Content = text,
-                        Type = type,
-                        Language = DetectLanguage(text)
-                    });
-                }
-            }
-        }
-
-        return paragraphs;
-    }
-
-    private string ExtractTitle(string content)
-    {
-        ArgumentNullException.ThrowIfNull(content);
-        
-        var doc = new HtmlDocument();
-        doc.LoadHtml(content);
-        
-        var titleNode = doc.DocumentNode.SelectSingleNode("//h1") ??
-                       doc.DocumentNode.SelectSingleNode("//title");
-                       
-        return titleNode?.InnerText.Trim() ?? string.Empty;
-    }
-
-    private string RebuildChapterContent(Models.EpubChapter chapter)
-    {
-        ArgumentNullException.ThrowIfNull(chapter);
-        
-        var content = new System.Text.StringBuilder();
-        content.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
-        content.AppendLine("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">");
-        content.AppendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\">");
-        content.AppendLine("<head>");
-        content.AppendLine("  <title>" + System.Security.SecurityElement.Escape(chapter.Title) + "</title>");
-        content.AppendLine("  <meta http-equiv=\"Content-Type\" content=\"application/xhtml+xml; charset=utf-8\"/>");
-        content.AppendLine("</head>");
-        content.AppendLine("<body>");
-
-        content.AppendLine($"  <h1>{System.Security.SecurityElement.Escape(chapter.Title)}</h1>");
-
-        foreach (var para in chapter.Paragraphs)
-        {
-            var text = System.Security.SecurityElement.Escape(
-                string.IsNullOrEmpty(para.TranslatedContent) ? para.Content : para.TranslatedContent
-            );
-                        
-            switch (para.Type)
-            {
-                case ParagraphType.Header:
-                    content.AppendLine($"  <h2>{text}</h2>");
-                    break;
-                case ParagraphType.Quote:
-                    content.AppendLine($"  <blockquote>{text}</blockquote>");
-                    break;
-                case ParagraphType.Code:
-                    content.AppendLine($"  <pre><code>{text}</code></pre>");
-                    break;
-                default:
-                    content.AppendLine($"  <p>{text}</p>");
-                    break;
-            }
-        }
-
-        content.AppendLine("</body>");
-        content.AppendLine("</html>");
-
-        return content.ToString();
-    }
-
-    private ParagraphType DetermineNodeType(HtmlNode node)
-    {
-        return node.Name switch
-        {
-            var name when name.StartsWith("h") => ParagraphType.Header,
-            "blockquote" => ParagraphType.Quote,
-            "pre" => ParagraphType.Code,
-            "table" => ParagraphType.Table,
-            _ => ParagraphType.Text
-        };
-    }
-
-    private string DetectLanguage(string text)
-    {
-        // Simple language detection based on character sets
-        // This should be replaced with a more sophisticated language detection library
-        if (Regex.IsMatch(text, @"\p{IsCJKUnifiedIdeographs}"))
-            return "zh";
-        
-        // Default to English if no specific scripts are detected
-        return "en";
     }
 }
