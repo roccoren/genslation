@@ -401,3 +401,6 @@ FodyWeavers.xsd
 
 # macOS .DS_Store
 .DS_Store
+
+# Remove appsettings.json
+appsettings.json
