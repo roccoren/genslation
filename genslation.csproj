@@ -1,10 +1,37 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- Basic Configuration -->
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    
+    <!-- Assembly Information -->
+    <Version>1.0.0</Version>
+    <Authors>Roo</Authors>
+    <Company>Roo Veterinary Inc</Company>
+    <Product>Genslation</Product>
+    <Description>A tool for translating EPUB files</Description>
+    <Copyright>Copyright © 2024</Copyright>
+
+    <!-- Build Configuration -->
+    <RuntimeIdentifiers>win-x64;linux-x64;osx-x64;osx-arm64</RuntimeIdentifiers>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>true</PublishTrimmed>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <DebugType>embedded</DebugType>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+    <!-- Optimization Flags -->
+    <Optimize>true</Optimize>
+    <DebugSymbols>false</DebugSymbols>
+
+    <!-- Output Paths -->
+    <OutDir>$(MSBuildThisFileDirectory)bin\$(Configuration)\$(TargetFramework)</OutDir>
+    <PublishDir>$(MSBuildThisFileDirectory)builds\$(RuntimeIdentifier)</PublishDir>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,5 +49,18 @@
     <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
     <PackageReference Include="VersOne.Epub" Version="3.3.1" />
   </ItemGroup>
+
+  <!-- Copy AppSettings for all platforms during publish -->
+  <Target Name="CopyAppSettings" AfterTargets="Publish">
+    <Copy SourceFiles="appsettings.sample.json" DestinationFiles="$(PublishDir)/appsettings.json" />
+  </Target>
+
+  <!-- Create ZIP archives for each platform -->
+  <Target Name="CreateZipArchives" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' != ''">
+    <ZipDirectory
+        SourceDirectory="$(PublishDir)"
+        DestinationFile="$(MSBuildThisFileDirectory)builds/genslation-$(RuntimeIdentifier).zip"
+        Overwrite="true" />
+  </Target>
 
 </Project>

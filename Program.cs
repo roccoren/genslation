@@ -1,4 +1,4 @@
-﻿﻿using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Serilog;
@@ -7,129 +7,203 @@ using genslation.Interfaces;
 using genslation.Services;
 using genslation.Models;
 
-var services = new ServiceCollection();
-
-// Ensure logs directory exists
-var logsDir = Path.GetDirectoryName("logs/genslation-.log");
-if (!string.IsNullOrEmpty(logsDir))
-{
-    Directory.CreateDirectory(logsDir);
-}
-
-// Configure Serilog
-Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Information()
-    .WriteTo.Console()
-    .WriteTo.File("logs/genslation-.log", rollingInterval: RollingInterval.Day)
-    .CreateLogger();
-
-services.AddLogging(builder =>
-{
-    builder.ClearProviders();
-    builder.AddSerilog(Log.Logger);
-});
-
-// Add configuration
-var configService = new ConfigurationService(
-    new LoggerFactory().CreateLogger<ConfigurationService>());
-services.AddSingleton(configService);
-services.AddSingleton(configService.Settings);
-
-// Configure Semantic Kernel
-var kernelBuilder = Kernel.CreateBuilder();
-
-if (configService.Settings.TranslationProvider.Provider == "AzureOpenAI")
-{
-    kernelBuilder.AddAzureOpenAIChatCompletion(
-        configService.Settings.TranslationProvider.AzureOpenAIDeployment,
-        configService.Settings.TranslationProvider.AzureOpenAIEndpoint,
-        configService.Settings.TranslationProvider.AzureOpenAIApiKey
-    );
-}
-else
-{
-    kernelBuilder.AddOpenAIChatCompletion(
-        configService.Settings.TranslationProvider.OpenAIModel,
-        configService.Settings.TranslationProvider.OpenAIApiKey
-    );
-}
-
-var kernel = kernelBuilder.Build();
-services.AddSingleton(kernel);
-
-// Add services
-services.AddSingleton<ITranslationMemoryService, TranslationMemoryService>();
-services.AddSingleton<IEpubProcessor, EpubProcessor>();
-services.AddSingleton<ITranslationProvider>(sp =>
-{
-    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var k = sp.GetRequiredService<Kernel>();
-    var settings = sp.GetRequiredService<AppSettings>();
-
-    if (settings.TranslationProvider.Provider == "AzureOpenAI")
-    {
-        return new AzureOpenAITranslationProvider(
-            k,
-            settings.TranslationProvider.AzureOpenAIEndpoint,
-            settings.TranslationProvider.AzureOpenAIDeployment,
-            settings.TranslationProvider.AzureOpenAIApiKey,
-            loggerFactory.CreateLogger<AzureOpenAITranslationProvider>(),
-            new TranslationOptions
-            {
-                MaxTokensPerRequest = settings.TranslationProvider.MaxTokensPerRequest,
-                MaxRetries = settings.TranslationProvider.MaxRetries,
-                RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds),
-                EnableTranslationMemory = false,  // Force disable translation memory
-                Temperature = settings.TranslationProvider.Temperature,
-                TopP = settings.TranslationProvider.TopP
-            });
-    }
-    else
-    {
-        return new OpenAITranslationProvider(
-            k,
-            settings.TranslationProvider.OpenAIApiKey,
-            settings.TranslationProvider.OpenAIModel,
-            loggerFactory.CreateLogger<OpenAITranslationProvider>(),
-            new TranslationOptions
-            {
-                MaxTokensPerRequest = settings.TranslationProvider.MaxTokensPerRequest,
-                MaxRetries = settings.TranslationProvider.MaxRetries,
-                RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds),
-                EnableTranslationMemory = false,  // Force disable translation memory
-                Temperature = settings.TranslationProvider.Temperature,
-                TopP = settings.TranslationProvider.TopP
-            });
-    }
-});
-
-// Register default TranslationOptions
-services.AddSingleton(new TranslationOptions
-{
-    MaxTokensPerRequest = configService.Settings.TranslationProvider.MaxTokensPerRequest,
-    MaxRetries = configService.Settings.TranslationProvider.MaxRetries,
-    RetryDelay = TimeSpan.FromMilliseconds(configService.Settings.TranslationProvider.RetryDelayMilliseconds),
-    EnableTranslationMemory = false,  // Force disable translation memory
-    PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting,
-    Temperature = configService.Settings.TranslationProvider.Temperature,
-    TopP = configService.Settings.TranslationProvider.TopP
-});
-
-services.AddSingleton<TranslationService>();
-
-var serviceProvider = services.BuildServiceProvider();
-
 try
 {
-    var translationService = serviceProvider.GetRequiredService<TranslationService>();
-    var epubProcessor = serviceProvider.GetRequiredService<IEpubProcessor>();
-    var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
+    // Check for appsettings.json and copy from sample if needed
+    if (!File.Exists("appsettings.json") && File.Exists("appsettings.sample.json"))
+    {
+        File.Copy("appsettings.sample.json", "appsettings.json");
+        Console.WriteLine("Created appsettings.json from sample file.");
+    }
+
+    // Initialize essential services first
+    var loggerFactory = new LoggerFactory();
+    var configService = new ConfigurationService(
+        loggerFactory.CreateLogger<ConfigurationService>());
+    var settings = configService.Settings;
+
+    // Handle help and validation before setting up full services
+    if (args.Length == 0 || (args.Length == 1 && (args[0] == "--help" || args[0] == "-h")))
+    {
+        Console.WriteLine(@"genslation - A tool for translating EPUB files using AI
+
+Usage:
+    genslation <input-epub> <output-epub> <source-lang> [target-lang]
+
+Arguments:
+    input-epub   Path to the input EPUB file
+    output-epub  Path where the translated EPUB will be saved
+    source-lang  Source language code (e.g., en, ja, ko)
+    target-lang  Target language code (default: zh)
+
+Options:
+    -h, --help   Display this help message
+
+Examples:
+    genslation input.epub output.epub en zh     # Translate from English to Chinese
+    genslation book.epub translated.epub ja zh   # Translate from Japanese to Chinese
+    genslation novel.epub output.epub ko        # Translate from Korean to Chinese
+
+Configuration Setup:
+    The program requires appsettings.json for configuration. If not present, it will be
+    automatically created from appsettings.sample.json on first run.
+
+    Note: Since appsettings.json may contain sensitive data (API keys, etc.),
+    it is excluded from source control.
+
+Current Settings (from appsettings.json):
+    Translation Provider Settings:
+        - Provider: " + settings.TranslationProvider.Provider + @"
+        - Model/Deployment: " + (settings.TranslationProvider.Provider == "AzureOpenAI" ? settings.TranslationProvider.AzureOpenAIDeployment : settings.TranslationProvider.OpenAIModel) + @"
+        - MaxTokensPerRequest: " + settings.TranslationProvider.MaxTokensPerRequest + @"
+        - Temperature: " + settings.TranslationProvider.Temperature + @"
+        - TopP: " + settings.TranslationProvider.TopP + @"
+        - MaxRetries: " + settings.TranslationProvider.MaxRetries + @"
+        - RetryDelay: " + settings.TranslationProvider.RetryDelayMilliseconds + "ms" + @"
+
+    EPUB Processing Settings:
+        - PreserveOriginalFormatting: " + settings.Epub.PreserveOriginalFormatting + @"
+        - IncludeTranslationMetadata: " + settings.Epub.IncludeTranslationMetadata + @"
+        - ValidateOutput: " + settings.Epub.ValidateOutput + @"
+        - OutputDirectory: '" + settings.Epub.OutputDirectory + @"'
+
+    Translation Memory:
+        - Enabled: " + settings.TranslationMemory.Enabled + @"
+        - MinimumSimilarity: " + settings.TranslationMemory.MinimumSimilarity + @"
+        - MaxResults: " + settings.TranslationMemory.MaxResults + @"
+        - RetentionDays: " + settings.TranslationMemory.RetentionDays + @"
+
+    Logging:
+        - Console and file logging enabled
+        - Log directory: '" + settings.Logging.LogDirectory + @"'
+        - Default log level: " + settings.Logging.LogLevel + @"
+
+For detailed configuration, modify appsettings.json in the program directory.");
+        return 0;
+    }
 
     if (args.Length < 3)
     {
-        Console.WriteLine("Usage: genslation <input-epub> <output-epub> <source-lang> <target-lang>");
+        Console.WriteLine("Error: Not enough arguments provided.");
+        Console.WriteLine("Use --help to see usage information.");
         return 1;
     }
+
+    // Set up full service collection
+    var services = new ServiceCollection();
+
+    // Ensure logs directory exists
+    var logsDir = Path.GetDirectoryName("logs/genslation-.log");
+    if (!string.IsNullOrEmpty(logsDir))
+    {
+        Directory.CreateDirectory(logsDir);
+    }
+
+    // Configure Serilog
+    Log.Logger = new LoggerConfiguration()
+        .MinimumLevel.Information()
+        .WriteTo.Console()
+        .WriteTo.File("logs/genslation-.log", rollingInterval: RollingInterval.Day)
+        .CreateLogger();
+
+    services.AddLogging(builder =>
+    {
+        builder.ClearProviders();
+        builder.AddSerilog(Log.Logger);
+    });
+
+    // Add configuration and settings
+    services.AddSingleton(configService);
+    services.AddSingleton(settings);
+
+    // Configure Semantic Kernel
+    var kernelBuilder = Kernel.CreateBuilder();
+
+    if (settings.TranslationProvider.Provider == "AzureOpenAI")
+    {
+        kernelBuilder.AddAzureOpenAIChatCompletion(
+            settings.TranslationProvider.AzureOpenAIDeployment,
+            settings.TranslationProvider.AzureOpenAIEndpoint,
+            settings.TranslationProvider.AzureOpenAIApiKey
+        );
+    }
+    else
+    {
+        kernelBuilder.AddOpenAIChatCompletion(
+            settings.TranslationProvider.OpenAIModel,
+            settings.TranslationProvider.OpenAIApiKey
+        );
+    }
+
+    var kernel = kernelBuilder.Build();
+    services.AddSingleton(kernel);
+
+    // Add service implementations
+    services.AddSingleton<ITranslationMemoryService, TranslationMemoryService>();
+    services.AddSingleton<IEpubProcessor, EpubProcessor>();
+    services.AddSingleton<ITranslationProvider>(sp =>
+    {
+        var logFactory = sp.GetRequiredService<ILoggerFactory>();
+        var k = sp.GetRequiredService<Kernel>();
+        var config = sp.GetRequiredService<AppSettings>();
+
+        if (config.TranslationProvider.Provider == "AzureOpenAI")
+        {
+            return new AzureOpenAITranslationProvider(
+                k,
+                config.TranslationProvider.AzureOpenAIEndpoint,
+                config.TranslationProvider.AzureOpenAIDeployment,
+                config.TranslationProvider.AzureOpenAIApiKey,
+                logFactory.CreateLogger<AzureOpenAITranslationProvider>(),
+                new TranslationOptions
+                {
+                    MaxTokensPerRequest = config.TranslationProvider.MaxTokensPerRequest,
+                    MaxRetries = config.TranslationProvider.MaxRetries,
+                    RetryDelay = TimeSpan.FromMilliseconds(config.TranslationProvider.RetryDelayMilliseconds),
+                    EnableTranslationMemory = false,
+                    Temperature = config.TranslationProvider.Temperature,
+                    TopP = config.TranslationProvider.TopP
+                });
+        }
+        else
+        {
+            return new OpenAITranslationProvider(
+                k,
+                config.TranslationProvider.OpenAIApiKey,
+                config.TranslationProvider.OpenAIModel,
+                logFactory.CreateLogger<OpenAITranslationProvider>(),
+                new TranslationOptions
+                {
+                    MaxTokensPerRequest = config.TranslationProvider.MaxTokensPerRequest,
+                    MaxRetries = config.TranslationProvider.MaxRetries,
+                    RetryDelay = TimeSpan.FromMilliseconds(config.TranslationProvider.RetryDelayMilliseconds),
+                    EnableTranslationMemory = false,
+                    Temperature = config.TranslationProvider.Temperature,
+                    TopP = config.TranslationProvider.TopP
+                });
+        }
+    });
+
+    // Register default TranslationOptions
+    services.AddSingleton(new TranslationOptions
+    {
+        MaxTokensPerRequest = settings.TranslationProvider.MaxTokensPerRequest,
+        MaxRetries = settings.TranslationProvider.MaxRetries,
+        RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds),
+        EnableTranslationMemory = false,
+        PreserveFormatting = settings.Epub.PreserveOriginalFormatting,
+        Temperature = settings.TranslationProvider.Temperature,
+        TopP = settings.TranslationProvider.TopP
+    });
+
+    services.AddSingleton<TranslationService>();
+
+    var serviceProvider = services.BuildServiceProvider();
+
+    // Process the translation
+    var translationService = serviceProvider.GetRequiredService<TranslationService>();
+    var epubProcessor = serviceProvider.GetRequiredService<IEpubProcessor>();
+    var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
 
     var inputFile = args[0];
     var outputFile = args[1];
@@ -151,14 +225,14 @@ try
     logger.LogInformation("Translating from {SourceLang} to {TargetLang}", sourceLang, targetLang);
     var translatedDocument = await translationService.TranslateDocumentAsync(
         document,
-        new TranslationOptions 
-        { 
+        new TranslationOptions
+        {
             SourceLanguage = sourceLang,
             TargetLanguage = targetLang,
-            EnableTranslationMemory = false,  // Force disable translation memory
-            MaxTokensPerRequest = configService.Settings.TranslationProvider.MaxTokensPerRequest,
-            Temperature = configService.Settings.TranslationProvider.Temperature,
-            TopP = configService.Settings.TranslationProvider.TopP
+            EnableTranslationMemory = false,
+            MaxTokensPerRequest = settings.TranslationProvider.MaxTokensPerRequest,
+            Temperature = settings.TranslationProvider.Temperature,
+            TopP = settings.TranslationProvider.TopP
         });
 
     // Save the translated ePub
@@ -168,8 +242,8 @@ try
         outputFile,
         new TranslationOptions
         {
-            PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting,
-            EnableTranslationMemory = false  // Force disable translation memory
+            PreserveFormatting = settings.Epub.PreserveOriginalFormatting,
+            EnableTranslationMemory = false
         });
 
     if (success)
