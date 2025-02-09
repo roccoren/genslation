@@ -137,59 +137,177 @@ namespace genslation.Services
         public async Task<bool> SaveTranslatedEpubAsync(EpubDocument originalDocument, string outputPath, TranslationOptions options)
         {
             var tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(tempDir);
-
+            _logger.LogInformation("Created temporary directory: {TempDir}", tempDir);
+            
             try
             {
-                // Extract original EPUB to temp directory
+                Directory.CreateDirectory(tempDir);
+                
+                // Verify temp directory permissions
+                try
+                {
+                    var testFile = Path.Combine(tempDir, "test.txt");
+                    await File.WriteAllTextAsync(testFile, "test", Encoding.UTF8);
+                    File.Delete(testFile);
+                    _logger.LogInformation("Temporary directory write permissions verified");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to verify temporary directory permissions: {TempDir}", tempDir);
+                    return false;
+                }
+
+                // Extract original EPUB
+                _logger.LogInformation("Extracting EPUB to: {FilePath}", originalDocument.FilePath);
                 ZipFile.ExtractToDirectory(originalDocument.FilePath, tempDir);
+
+                // Log extracted files
+                var extractedFiles = Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories);
+                _logger.LogInformation("Extracted {Count} files:", extractedFiles.Length);
+                foreach (var file in extractedFiles)
+                {
+                    _logger.LogDebug("- {FilePath} ({Size} bytes)",
+                        Path.GetRelativePath(tempDir, file),
+                        new FileInfo(file).Length);
+                }
 
                 // Update chapters with translations
                 foreach (var chapter in originalDocument.Chapters)
                 {
                     var chapterPath = Path.Combine(tempDir, chapter.OriginalPath);
-                    if (File.Exists(chapterPath))
+                    _logger.LogInformation("Processing chapter: {ChapterPath}", chapter.OriginalPath);
+
+                    if (!File.Exists(chapterPath))
                     {
+                        _logger.LogError("Chapter file not found: {ChapterPath}", chapterPath);
+                        continue;
+                    }
+
+                    try
+                    {
+                        // Read original content for verification
+                        var originalContent = await File.ReadAllTextAsync(chapterPath, Encoding.UTF8);
+                        _logger.LogDebug("Original chapter content sample:\n{Content}",
+                            originalContent.Length > 500 ? originalContent.Substring(0, 500) + "..." : originalContent);
+
+                        // Generate translated content
                         var translatedContent = RebuildChapterContent(chapter);
-                        await File.WriteAllTextAsync(chapterPath, translatedContent);
+                        _logger.LogDebug("Translated chapter content sample:\n{Content}",
+                            translatedContent.Length > 500 ? translatedContent.Substring(0, 500) + "..." : translatedContent);
+
+                        // Write with explicit UTF-8 encoding
+                        await File.WriteAllTextAsync(chapterPath, translatedContent, new UTF8Encoding(false));
+                        
+                        // Verify written content
+                        var verificationContent = await File.ReadAllTextAsync(chapterPath, Encoding.UTF8);
+                        if (verificationContent != translatedContent)
+                        {
+                            _logger.LogError("Content verification failed for chapter: {ChapterPath}", chapter.OriginalPath);
+                            _logger.LogDebug("Expected length: {Expected}, Actual length: {Actual}",
+                                translatedContent.Length, verificationContent.Length);
+                            return false;
+                        }
+                        
+                        _logger.LogInformation("Successfully processed chapter: {ChapterPath}", chapter.OriginalPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to process chapter: {ChapterPath}", chapterPath);
+                        return false;
                     }
                 }
 
-                // Update metadata
+                // Update metadata with explicit encoding
                 var contentOpfPath = Path.Combine(tempDir, "content.opf");
                 if (File.Exists(contentOpfPath))
                 {
-                    var content = await File.ReadAllTextAsync(contentOpfPath);
-                    content = Regex.Replace(content, @"<dc:language>[^<]+</dc:language>", $"<dc:language>{options.TargetLanguage}</dc:language>");
-                    await File.WriteAllTextAsync(contentOpfPath, content);
+                    try
+                    {
+                        var content = await File.ReadAllTextAsync(contentOpfPath, Encoding.UTF8);
+                        _logger.LogDebug("Original content.opf:\n{Content}", content);
+
+                        content = Regex.Replace(content,
+                            @"<dc:language>[^<]+</dc:language>",
+                            $"<dc:language>{options.TargetLanguage}</dc:language>");
+                        
+                        await File.WriteAllTextAsync(contentOpfPath, content, new UTF8Encoding(false));
+                        _logger.LogInformation("Updated content.opf language to: {Language}", options.TargetLanguage);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to update content.opf");
+                        return false;
+                    }
                 }
 
-                // Save cover image
+                // Save cover image if present
                 if (originalDocument.CoverImage != null)
                 {
                     var coverPath = Path.Combine(tempDir, "cover.jpg");
-                    await File.WriteAllBytesAsync(coverPath, originalDocument.CoverImage);
+                    try
+                    {
+                        await File.WriteAllBytesAsync(coverPath, originalDocument.CoverImage);
+                        _logger.LogInformation("Saved cover image: {Size} bytes", originalDocument.CoverImage.Length);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to save cover image");
+                        return false;
+                    }
+                }
+
+                // Log final temporary directory contents
+                var finalFiles = Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories);
+                _logger.LogInformation("Final temporary directory contents ({Count} files):", finalFiles.Length);
+                foreach (var file in finalFiles)
+                {
+                    _logger.LogDebug("- {FilePath} ({Size} bytes)",
+                        Path.GetRelativePath(tempDir, file),
+                        new FileInfo(file).Length);
                 }
 
                 // Create output EPUB
                 if (File.Exists(outputPath))
                 {
+                    _logger.LogInformation("Removing existing output file: {OutputPath}", outputPath);
                     File.Delete(outputPath);
                 }
+
+                _logger.LogInformation("Creating EPUB from temporary directory");
                 ZipFile.CreateFromDirectory(tempDir, outputPath);
+
+                // Verify output file
+                if (!File.Exists(outputPath))
+                {
+                    _logger.LogError("Output file was not created: {OutputPath}", outputPath);
+                    return false;
+                }
+
+                var outputFileInfo = new FileInfo(outputPath);
+                _logger.LogInformation("Successfully created EPUB: {OutputPath} ({Size} bytes)",
+                    outputPath,
+                    outputFileInfo.Length);
 
                 return true;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to save translated EPUB.");
+                _logger.LogError(ex, "Failed to save translated EPUB");
                 return false;
             }
             finally
             {
-                if (Directory.Exists(tempDir))
+                try
                 {
-                    Directory.Delete(tempDir, true);
+                    if (Directory.Exists(tempDir))
+                    {
+                        Directory.Delete(tempDir, true);
+                        _logger.LogInformation("Cleaned up temporary directory: {TempDir}", tempDir);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to cleanup temporary directory: {TempDir}", tempDir);
                 }
             }
         }
@@ -198,7 +316,6 @@ namespace genslation.Services
         {
             var resources = new List<EpubResource>();
             
-            // Extract HTML content
             foreach (var htmlFile in book.Content.Html.Local)
             {
                 resources.Add(new EpubResource
@@ -211,7 +328,6 @@ namespace genslation.Services
                 });
             }
             
-            // Extract images
             foreach (var imageFile in book.Content.Images.Local)
             {
                 resources.Add(new EpubResource
@@ -224,7 +340,6 @@ namespace genslation.Services
                 });
             }
             
-            // Extract CSS
             foreach (var cssFile in book.Content.Css.Local)
             {
                 resources.Add(new EpubResource
@@ -245,11 +360,15 @@ namespace genslation.Services
             var chapters = new List<EpubChapter>();
             foreach (var item in book.ReadingOrder)
             {
+                var htmlDoc = new HtmlDocument();
+                htmlDoc.LoadHtml(item.Content);
+                
                 chapters.Add(new EpubChapter
                 {
                     Id = Guid.NewGuid().ToString(),
                     Title = Path.GetFileNameWithoutExtension(item.FilePath),
                     OriginalPath = item.FilePath,
+                    OriginalContent = item.Content, // Store the complete original HTML
                     Paragraphs = ParseParagraphs(item.Content)
                 });
             }
@@ -285,7 +404,8 @@ namespace genslation.Services
                 {
                     Content = node.InnerText.Trim(),
                     OriginalHtml = node.OuterHtml,
-                    Type = type
+                    Type = type,
+                    NodePath = node.XPath // Store XPath for later reconstruction
                 });
             }
 
@@ -294,16 +414,62 @@ namespace genslation.Services
 
         private string RebuildChapterContent(EpubChapter chapter)
         {
+            if (string.IsNullOrEmpty(chapter.OriginalContent))
+            {
+                _logger.LogWarning("Original content missing for chapter: {ChapterId}", chapter.Id);
+                return BuildBasicChapterContent(chapter);
+            }
+
+            var doc = new HtmlDocument();
+            doc.LoadHtml(chapter.OriginalContent);
+
+            // Update translatable nodes while preserving structure
+            foreach (var paragraph in chapter.Paragraphs)
+            {
+                if (string.IsNullOrEmpty(paragraph.NodePath))
+                {
+                    _logger.LogWarning("Node path missing for paragraph in chapter {ChapterId}", chapter.Id);
+                    continue;
+                }
+
+                var node = doc.DocumentNode.SelectSingleNode(paragraph.NodePath);
+                if (node != null)
+                {
+                    // Preserve attributes and surrounding HTML structure
+                    node.InnerHtml = paragraph.TranslatedContent ?? paragraph.Content;
+                }
+                else
+                {
+                    _logger.LogWarning("Could not find node at path {Path} in chapter {ChapterId}", paragraph.NodePath, chapter.Id);
+                }
+            }
+
+            return doc.DocumentNode.OuterHtml;
+        }
+
+        private string BuildBasicChapterContent(EpubChapter chapter)
+        {
             var content = new StringBuilder();
             content.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
             content.AppendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\">");
             content.AppendLine("<head>");
             content.AppendLine($"<title>{chapter.Title}</title>");
+            content.AppendLine("<link rel=\"stylesheet\" type=\"text/css\" href=\"styles.css\" />");
             content.AppendLine("</head>");
             content.AppendLine("<body>");
             foreach (var paragraph in chapter.Paragraphs)
             {
-                content.AppendLine($"<p>{paragraph.TranslatedContent ?? paragraph.Content}</p>");
+                var tag = paragraph.Type switch
+                {
+                    ParagraphType.Heading1 => "h1",
+                    ParagraphType.Heading2 => "h2",
+                    ParagraphType.Heading3 => "h3",
+                    ParagraphType.Heading4 => "h4",
+                    ParagraphType.Heading5 => "h5",
+                    ParagraphType.Heading6 => "h6",
+                    _ => "p"
+                };
+                content.AppendLine($"<{tag}>{paragraph.TranslatedContent ?? paragraph.Content}</{tag}>");
             }
             content.AppendLine("</body>");
             content.AppendLine("</html>");

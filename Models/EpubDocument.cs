@@ -21,6 +21,7 @@ public class EpubChapter
     public Dictionary<string, string> Metadata { get; set; } = new();
     public string OriginalPath { get; set; } = string.Empty;
     public Dictionary<string, string> StyleAttributes { get; set; } = new();
+    public string OriginalContent { get; set; } = string.Empty; // Added to preserve complete HTML structure
 }
 
 public class EpubParagraph
@@ -34,6 +35,7 @@ public class EpubParagraph
     public List<string> Tags { get; set; } = new();
     public string OriginalHtml { get; set; } = string.Empty;
     public List<EpubTextStyle> Styles { get; set; } = new();
+    public string NodePath { get; set; } = string.Empty; // Added to track node location in HTML
 }
 
 public class EpubResource

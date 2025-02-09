@@ -1,6 +1,7 @@
 namespace genslation.Services;
 
 using System.Diagnostics;
+using System.Text.Json;
 using genslation.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
@@ -41,13 +42,17 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
         {
             var stopwatch = Stopwatch.StartNew();
             var estimatedTokens = await EstimateTokenCount(text);
+            var requestId = Guid.NewGuid().ToString("N");
             
             _logger.LogInformation(
-                "Starting translation: Source={SourceLang}, Target={TargetLang}, Tokens={Tokens}, Model={Model}",
+                "Translation Request [{RequestId}] Started at {Timestamp}\nEndpoint: {Endpoint}\nDeployment: {Model}\nSource Language: {SourceLang}\nTarget Language: {TargetLang}\nEstimated Tokens: {Tokens}",
+                requestId,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                _endpoint,
+                _deploymentName,
                 sourceLanguage,
                 targetLanguage,
-                estimatedTokens,
-                _deploymentName);
+                estimatedTokens);
 
             var result = new TranslationResult
             {
@@ -61,12 +66,12 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
 
             if (string.IsNullOrWhiteSpace(text))
             {
-                _logger.LogWarning("Empty text provided for translation");
+                _logger.LogWarning("[{RequestId}] Empty text provided for translation", requestId);
                 return CreateErrorResult(text, "Empty text provided");
             }
 
             var chunks = await SplitIntoChunks(text, options.MaxTokensPerRequest);
-            _logger.LogInformation("Split text into {ChunkCount} chunks", chunks.Count);
+            _logger.LogInformation("[{RequestId}] Split text into {ChunkCount} chunks", requestId, chunks.Count);
             
             var translatedChunks = new List<string>();
             var chunkIndex = 0;
@@ -79,23 +84,26 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
                 
                 try
                 {
-                    _logger.LogTrace(
-                        "Translating chunk {Index}/{Total}: Length={Length}, Text={Text}",
+                    _logger.LogInformation(
+                        "Request [{RequestId}] Chunk {Index}/{Total} at {Timestamp}\n=== Source Text ===\n{Text}\n=== Prompt ===\n{Prompt}",
+                        requestId,
                         chunkIndex,
                         chunks.Count,
-                        chunk.Length,
-                        chunk.Length > 50 ? chunk.Substring(0, 50) + "..." : chunk);
+                        DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                        chunk,
+                        prompt);
 
                     var promptExecutionSettings = new OpenAIPromptExecutionSettings
                     {
-                        MaxTokens = 2000,
+                        MaxTokens = options.MaxTokensPerRequest,
                         Temperature = options.Temperature ?? 0.3,
                         TopP = options.TopP ?? 0.95,
                         ChatSystemPrompt = "You are a professional translator specialized in technical content."
                     };
 
                     _logger.LogDebug(
-                        "API Request: Model={Model}, MaxTokens={MaxTokens}, Temperature={Temperature}, TopP={TopP}",
+                        "[{RequestId}] API Settings: Model={Model}, MaxTokens={MaxTokens}, Temperature={Temperature}, TopP={TopP}",
+                        requestId,
                         _deploymentName,
                         promptExecutionSettings.MaxTokens,
                         promptExecutionSettings.Temperature,
@@ -108,7 +116,9 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
                     {
                         var error = functionResult.Metadata["Error"];
                         _logger.LogError(
-                            "Translation error for chunk {Index}: {Error}, Text={Text}",
+                            "Response [{RequestId}] Error at {Timestamp}\nChunk {Index}: {Error}\n=== Failed Text ===\n{Text}",
+                            requestId,
+                            DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                             chunkIndex,
                             error,
                             chunk);
@@ -120,19 +130,24 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
 
                     chunkStopwatch.Stop();
                     _logger.LogInformation(
-                        "Chunk {Index}/{Total} translated successfully in {Duration}ms",
+                        "Response [{RequestId}] Success at {Timestamp}\nChunk {Index}/{Total} completed in {Duration}ms\n=== Translated Text ===\n{Translation}",
+                        requestId,
+                        DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                         chunkIndex,
                         chunks.Count,
-                        chunkStopwatch.ElapsedMilliseconds);
+                        chunkStopwatch.ElapsedMilliseconds,
+                        translatedText);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(
-                        ex,
-                        "Failed to translate chunk {Index}/{Total}: {Error}, Text={Text}",
+                        "Response [{RequestId}] Error at {Timestamp}\nChunk {Index}/{Total}: {Error}\n=== Stack Trace ===\n{StackTrace}\n=== Failed Text ===\n{Text}",
+                        requestId,
+                        DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                         chunkIndex,
                         chunks.Count,
                         ex.Message,
+                        ex.StackTrace,
                         chunk);
                     return CreateErrorResult(text, $"Translation failed: {ex.Message}");
                 }
@@ -144,7 +159,9 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
             result.Metrics.ProcessingTime = stopwatch.Elapsed;
 
             _logger.LogInformation(
-                "Translation completed: Chunks={Chunks}, TotalTime={Duration}ms, AverageChunkTime={AverageTime}ms",
+                "Translation [{RequestId}] Completed at {Timestamp}\nTotal Chunks: {Chunks}\nTotal Time: {Duration}ms\nAverage Time Per Chunk: {AverageTime}ms",
+                requestId,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                 chunks.Count,
                 stopwatch.ElapsedMilliseconds,
                 stopwatch.ElapsedMilliseconds / chunks.Count);
@@ -153,18 +170,33 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Translation failed");
+            _logger.LogError(
+                ex,
+                "Translation failed at {Timestamp}\nError: {Message}\nStack Trace: {StackTrace}",
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                ex.Message,
+                ex.StackTrace);
             return CreateErrorResult(text, $"Translation failed: {ex.Message}");
         }
     }
 
     public override async Task<bool> ValidateConfigurationAsync()
     {
+        var validationId = Guid.NewGuid().ToString("N");
+        _logger.LogInformation(
+            "Configuration Validation [{ValidationId}] Started at {Timestamp}\nEndpoint: {Endpoint}\nDeployment: {Model}",
+            validationId,
+            DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+            _endpoint,
+            _deploymentName);
+
         if (string.IsNullOrEmpty(_apiKey) || 
             string.IsNullOrEmpty(_endpoint) || 
             string.IsNullOrEmpty(_deploymentName))
         {
-            _logger.LogError("Azure OpenAI configuration is incomplete");
+            _logger.LogError(
+                "[{ValidationId}] Validation Failed: Azure OpenAI configuration is incomplete",
+                validationId);
             return false;
         }
 
@@ -177,11 +209,22 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
                 "zh",
                 _defaultOptions);
 
+            _logger.LogInformation(
+                "Configuration Validation [{ValidationId}] Completed at {Timestamp}\nStatus: {Status}",
+                validationId,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                result.Success ? "Success" : "Failed");
+
             return result.Success;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Configuration validation failed");
+            _logger.LogError(
+                ex,
+                "Configuration Validation [{ValidationId}] Failed at {Timestamp}\nError: {Message}",
+                validationId,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                ex.Message);
             return false;
         }
     }

@@ -71,7 +71,10 @@ public class TranslationService
         {
             Id = chapter.Id,
             Title = await TranslateTextWithMemoryAsync(chapter.Title, options, cancellationToken),
-            Metadata = new Dictionary<string, string>(chapter.Metadata)
+            Metadata = new Dictionary<string, string>(chapter.Metadata),
+            OriginalPath = chapter.OriginalPath,
+            OriginalContent = chapter.OriginalContent,
+            StyleAttributes = new Dictionary<string, string>(chapter.StyleAttributes)
         };
 
         foreach (var paragraph in chapter.Paragraphs)
@@ -95,7 +98,10 @@ public class TranslationService
             Type = paragraph.Type,
             Language = options.TargetLanguage,
             Metadata = new Dictionary<string, string>(paragraph.Metadata),
-            Tags = new List<string>(paragraph.Tags)
+            Tags = new List<string>(paragraph.Tags),
+            OriginalHtml = paragraph.OriginalHtml,
+            NodePath = paragraph.NodePath,
+            Styles = new List<EpubTextStyle>(paragraph.Styles)
         };
 
         try
