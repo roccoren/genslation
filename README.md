@@ -1,6 +1,6 @@
 # Genslation
 
-A C# .NET tool for translating ePub books while preserving their original structure and formatting, using Microsoft's Semantic Kernel for high-quality translations.
+A C# .NET tool for translating ePub books while preserving their original structure and formatting, leveraging AI language models for high-quality translations.
 
 ## Features
 
@@ -15,7 +15,7 @@ A C# .NET tool for translating ePub books while preserving their original struct
 
 ## Requirements
 
-- .NET 8.0 SDK
+- .NET 9.0 SDK
 - OpenAI API key or Azure OpenAI subscription
 - Sufficient disk space for translation memory
 
@@ -32,19 +32,74 @@ cd genslation
 dotnet build
 ```
 
+3. Copy and configure settings:
+```bash
+cp appsettings.sample.json appsettings.json
+```
+
 ## Configuration
 
-Configure the application by editing `appsettings.json`:
+The application is configured through `appsettings.json` with the following sections:
+
+### Translation Provider
 
 ```json
 {
   "TranslationProvider": {
     "Provider": "OpenAI",  // or "AzureOpenAI"
-    "OpenAIApiKey": "your-api-key",
+    "OpenAIApiKey": "your-openai-api-key-here",
     "OpenAIModel": "gpt-4-turbo-preview",
-    "AzureOpenAIEndpoint": "",
-    "AzureOpenAIDeployment": "",
-    "AzureOpenAIApiKey": ""
+    "AzureOpenAIEndpoint": "https://your-resource.openai.azure.com/",
+    "AzureOpenAIDeployment": "your-deployment-name",
+    "AzureOpenAIApiKey": "your-azure-openai-key-here",
+    "MaxTokensPerRequest": 2000,
+    "MaxRetries": 3,
+    "RetryDelayMilliseconds": 1000,
+    "Temperature": 0.3,
+    "TopP": 0.95
+  }
+}
+```
+
+### Translation Memory
+
+```json
+{
+  "TranslationMemory": {
+    "Enabled": true,
+    "StorageDirectory": "translation_memory",
+    "MinimumSimilarity": 0.9,
+    "MaxResults": 5,
+    "RetentionDays": 90,
+    "AutoOptimize": true
+  }
+}
+```
+
+### EPub Settings
+
+```json
+{
+  "Epub": {
+    "OutputDirectory": "output",
+    "PreserveOriginalFormatting": true,
+    "IncludeTranslationMetadata": true,
+    "ValidateOutput": true
+  }
+}
+```
+
+### Logging
+
+```json
+{
+  "Logging": {
+    "LogLevel": "Information",
+    "LogDirectory": "logs",
+    "ConsoleLogging": true,
+    "FileLogging": true,
+    "FilenamePattern": "genslation-{Date}.log",
+    "IncludeScopes": true
   }
 }
 ```
@@ -53,46 +108,52 @@ Configure the application by editing `appsettings.json`:
 
 Basic usage:
 ```bash
-dotnet run <input-epub> <output-epub> <source-lang> <target-lang>
+genslation <input-epub> <output-epub> <source-lang> <target-lang>
 ```
 
 Example:
 ```bash
-dotnet run book.epub book-zh.epub en zh
+genslation book.epub book-zh.epub en zh
 ```
+
+Parameters:
+- `input-epub`: Path to the source ePub file
+- `output-epub`: Path where the translated ePub will be saved
+- `source-lang`: Source language code (e.g., 'en', 'ja', 'ko')
+- `target-lang`: Target language code (defaults to 'zh' if not specified)
 
 ## Features in Detail
 
+### Translation Provider Options
+
+- `MaxTokensPerRequest`: Maximum tokens per API request
+- `MaxRetries`: Number of retries for failed API calls
+- `RetryDelayMilliseconds`: Delay between retries
+- `Temperature`: Controls randomness in translation (0.0-1.0)
+- `TopP`: Controls diversity in translation (0.0-1.0)
+
 ### Translation Memory
 
-The translation memory system helps maintain consistency across translations and improves efficiency by reusing previously translated content. Configure its behavior in `appsettings.json`:
+The translation memory system helps maintain consistency across translations by:
+- Storing and reusing previous translations
+- Matching similar content based on configurable similarity threshold
+- Automatic optimization of the translation memory database
+- Configurable retention period for translations
 
-```json
-{
-  "TranslationMemory": {
-    "Enabled": true,
-    "MinimumSimilarity": 0.9,
-    "MaxResults": 5,
-    "RetentionDays": 90
-  }
-}
-```
+### EPub Processing
 
-### Quality Control
+- Preserves original ePub structure and formatting
+- Optionally includes translation metadata
+- Validates output ePub files
+- Customizable output directory
 
-Quality checks are performed during translation:
-- Language detection and verification
-- Formatting consistency checks
-- Technical terminology preservation
-- Context-aware translation
+### Logging
 
-### Error Handling
-
-The application includes robust error handling:
-- Automatic retry for API failures
-- Fallback mechanisms
-- Detailed error logging
-- Progress preservation
+- Comprehensive logging system
+- Console and file logging support
+- Configurable log levels
+- Daily log rotation
+- Detailed error tracking
 
 ## Contributing
 
