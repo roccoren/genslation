@@ -274,7 +274,37 @@ namespace genslation.Services
                 }
 
                 _logger.LogInformation("Creating EPUB from temporary directory");
-                ZipFile.CreateFromDirectory(tempDir, outputPath);
+                using (var zipToOpen = new FileStream(outputPath, FileMode.Create))
+                {
+                    using (var archive = new ZipArchive(zipToOpen, ZipArchiveMode.Create))
+                    {
+                        // Add mimetype file uncompressed
+                        var mimetypePath = Path.Combine(tempDir, "mimetype");
+                        if (File.Exists(mimetypePath))
+                        {
+                            var mimetypeEntry = archive.CreateEntry("mimetype", CompressionLevel.NoCompression);
+                            using (var mimetypeStream = mimetypeEntry.Open())
+                            using (var fileStream = File.OpenRead(mimetypePath))
+                            {
+                                fileStream.CopyTo(mimetypeStream);
+                            }
+                        }
+                
+                        // Add all other files
+                        foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
+                        {
+                            if (Path.GetFileName(file) == "mimetype") continue;
+                
+                            var relativePath = Path.GetRelativePath(tempDir, file).Replace("\\", "/");
+                            var entry = archive.CreateEntry(relativePath, CompressionLevel.Optimal);
+                            using (var entryStream = entry.Open())
+                            using (var fileStream = File.OpenRead(file))
+                            {
+                                fileStream.CopyTo(entryStream);
+                            }
+                        }
+                    }
+                }
 
                 // Verify output file
                 if (!File.Exists(outputPath))
@@ -444,7 +474,13 @@ namespace genslation.Services
                 }
             }
 
-            return doc.DocumentNode.OuterHtml;
+            return EnsureProperXhtmlTags(doc.DocumentNode.OuterHtml);
+        }
+
+        private string EnsureProperXhtmlTags(string content)
+        {
+            // Ensure link tags are properly self-closing
+            return Regex.Replace(content, @"<link([^>]+?)>(?:</link>)?", "<link$1 />");
         }
 
         private string BuildBasicChapterContent(EpubChapter chapter)
