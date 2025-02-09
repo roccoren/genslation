@@ -11,6 +11,7 @@ public class EpubDocument
     public byte[]? CoverImage { get; set; }
     public List<EpubResource> Resources { get; set; } = new();
     public List<EpubNavigationItem> TableOfContents { get; set; } = new();
+    public TranslationMetrics? TranslationMetrics { get; set; }
 }
 
 public class EpubChapter

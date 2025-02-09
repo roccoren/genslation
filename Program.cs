@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿﻿﻿﻿﻿﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Serilog;
@@ -13,7 +13,7 @@ try
     if (!File.Exists("appsettings.json") && File.Exists("appsettings.sample.json"))
     {
         File.Copy("appsettings.sample.json", "appsettings.json");
-        Console.WriteLine("Created appsettings.json from sample file.");
+        // Suppress console output for appsettings creation
     }
 
     // Initialize essential services first
@@ -84,8 +84,7 @@ For detailed configuration, modify appsettings.json in the program directory.");
 
     if (args.Length < 3)
     {
-        Console.WriteLine("Error: Not enough arguments provided.");
-        Console.WriteLine("Use --help to see usage information.");
+        // Suppress error prompts for insufficient arguments
         return 1;
     }
 
@@ -221,6 +220,9 @@ For detailed configuration, modify appsettings.json in the program directory.");
     logger.LogInformation("Loading ePub: {InputFile}", inputFile);
     var document = await epubProcessor.LoadAsync(inputFile);
 
+    // Track total translation time
+    var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
     // Translate the document
     logger.LogInformation("Translating from {SourceLang} to {TargetLang}", sourceLang, targetLang);
     var translatedDocument = await translationService.TranslateDocumentAsync(
@@ -235,6 +237,14 @@ For detailed configuration, modify appsettings.json in the program directory.");
             TopP = settings.TranslationProvider.TopP
         });
 
+    totalStopwatch.Stop();
+
+    if (translatedDocument.TranslationMetrics == null)
+    {
+        translatedDocument.TranslationMetrics = new TranslationMetrics();
+    }
+    translatedDocument.TranslationMetrics.ProcessingTime = totalStopwatch.Elapsed;
+
     // Save the translated ePub
     logger.LogInformation("Saving translated ePub: {OutputFile}", outputFile);
     var success = await epubProcessor.SaveTranslatedEpubAsync(
@@ -248,6 +258,35 @@ For detailed configuration, modify appsettings.json in the program directory.");
 
     if (success)
     {
+        // Display detailed performance metrics
+        if (translatedDocument.TranslationMetrics != null)
+        {
+            var metrics = translatedDocument.TranslationMetrics;
+            Console.WriteLine("\nTranslation Performance Metrics");
+            Console.WriteLine("=============================");
+            Console.WriteLine("Time and Processing");
+            Console.WriteLine($"  Total Time: {metrics.ProcessingTime.TotalMilliseconds:N0} ms");
+
+            if (metrics.ChapterTokenCounts.Any())
+            {
+                Console.WriteLine("\nToken Distribution");
+                foreach (var (chunk, tokens) in metrics.ChapterTokenCounts)
+                {
+                    Console.WriteLine($"  {chunk}: {tokens:N0} tokens");
+                }
+            }
+
+            if (metrics.Cost > 0)
+            {
+                Console.WriteLine("\nCost Information");
+                Console.WriteLine($"  Total Cost: ${metrics.Cost:N4}");
+            }
+            
+            Console.WriteLine("=============================\n");
+            // Clear token usage summary after displaying metrics
+            translatedDocument.TranslationMetrics = null;
+        }
+
         logger.LogInformation("Translation completed successfully");
         return 0;
     }

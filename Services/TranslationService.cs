@@ -45,7 +45,21 @@ public class TranslationService
             Author = document.Author,
             Language = options.TargetLanguage,
             FilePath = document.FilePath,
-            Metadata = new Dictionary<string, string>(document.Metadata)
+            Metadata = new Dictionary<string, string>(document.Metadata),
+            TranslationMetrics = new TranslationMetrics
+            {
+                Provider = _translationProvider.Name,
+                ProcessingTime = TimeSpan.Zero,
+                PromptTokens = 0,
+                CompletionTokens = 0,
+                Cost = 0
+            }
+        };
+
+        // Reset metrics for new document
+        _currentDocumentMetrics = new TranslationMetrics
+        {
+            Provider = _translationProvider.Name
         };
 
         foreach (var chapter in document.Chapters)
@@ -54,10 +68,13 @@ public class TranslationService
             translatedDocument.Chapters.Add(translatedChapter);
             
             _logger.LogInformation(
-                "Translated chapter {ChapterId}: {Title}", 
-                chapter.Id, 
+                "Translated chapter {ChapterId}: {Title}",
+                chapter.Id,
                 chapter.Title);
         }
+
+        // Set final metrics
+        translatedDocument.TranslationMetrics = _currentDocumentMetrics;
 
         return translatedDocument;
     }
@@ -118,6 +135,8 @@ public class TranslationService
         return translatedParagraph;
     }
 
+    private TranslationMetrics _currentDocumentMetrics = new();
+
     private async Task<string> TranslateTextWithMemoryAsync(
         string text,
         TranslationOptions options,
@@ -152,6 +171,15 @@ public class TranslationService
         if (!result.Success)
         {
             throw new Exception($"Translation failed: {result.Error}");
+        }
+
+        // Accumulate metrics
+        if (result.Success && result.Metrics != null)
+        {
+            _currentDocumentMetrics.PromptTokens += result.Metrics.PromptTokens;
+            _currentDocumentMetrics.CompletionTokens += result.Metrics.CompletionTokens;
+            _currentDocumentMetrics.ProcessingTime += result.Metrics.ProcessingTime;
+            _currentDocumentMetrics.Cost += result.Metrics.Cost;
         }
 
         // Store in translation memory

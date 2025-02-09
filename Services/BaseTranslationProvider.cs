@@ -82,7 +82,6 @@ public abstract class BaseTranslationProvider : ITranslationProvider
             var sentenceTokens = await EstimateTokenCount(sentence);
             if (sentenceTokens > maxTokens)
             {
-                _logger.LogWarning("Sentence exceeds maximum token limit and will be split: {Sentence}", sentence);
                 var words = sentence.Split(' ');
                 var currentPart = new List<string>();
                 var partTokenCount = 0;

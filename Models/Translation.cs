@@ -30,12 +30,22 @@ public class TranslationResult
 
 public class TranslationMetrics
 {
-    public int TokenCount { get; set; }
+    public int SourceTokenCount { get; set; }
+    public int TargetTokenCount { get; set; }
+    public int PromptTokens { get; set; }
+    public int CompletionTokens { get; set; }
+    public int TotalTokens => PromptTokens + CompletionTokens;
     public int CharacterCount { get; set; }
     public TimeSpan ProcessingTime { get; set; }
     public int RetryCount { get; set; }
     public string Provider { get; set; } = string.Empty;
     public double Cost { get; set; }
+    public double QuotaUsageRate { get; set; }
+    public int MaxQuota { get; set; }
+    public Dictionary<string, int> ChapterTokenCounts { get; set; } = new();
+    
+    public int RemainingQuota => MaxQuota - TotalTokens;
+    public double QuotaPercentage => MaxQuota > 0 ? (TotalTokens / (double)MaxQuota) * 100 : 0;
 }
 
 public class QualityIssue

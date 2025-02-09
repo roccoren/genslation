@@ -3,6 +3,7 @@ namespace genslation.Services;
 using System.Diagnostics;
 using System.Text.Json;
 using genslation.Models;
+using genslation.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
@@ -60,14 +61,14 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
                 Metrics = new TranslationMetrics
                 {
                     Provider = Name,
-                    TokenCount = estimatedTokens
+                    SourceTokenCount = estimatedTokens,
+                    MaxQuota = options.MaxTokensPerRequest,
+                    ChapterTokenCounts = new Dictionary<string, int>()
                 }
             };
 
             if (string.IsNullOrWhiteSpace(text))
             {
-                _logger.LogWarning("[{RequestId}] Empty text provided for translation", requestId);
-                return CreateErrorResult(text, "Empty text provided");
             }
 
             var chunks = await SplitIntoChunks(text, options.MaxTokensPerRequest);
@@ -85,13 +86,12 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
                 try
                 {
                     _logger.LogInformation(
-                        "Request [{RequestId}] Chunk {Index}/{Total} at {Timestamp}\n=== Source Text ===\n{Text}\n=== Prompt ===\n{Prompt}",
+                        "Request [{RequestId}] Chunk {Index}/{Total} at {Timestamp}\n=== Source Text ===\n{Text}",
                         requestId,
                         chunkIndex,
                         chunks.Count,
                         DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                        chunk,
-                        prompt);
+                        chunk);
 
                     var promptExecutionSettings = new OpenAIPromptExecutionSettings
                     {
@@ -128,15 +128,15 @@ public class AzureOpenAITranslationProvider : BaseTranslationProvider
                     var translatedText = functionResult.GetValue<string>() ?? string.Empty;
                     translatedChunks.Add(translatedText);
 
+
                     chunkStopwatch.Stop();
                     _logger.LogInformation(
-                        "Response [{RequestId}] Success at {Timestamp}\nChunk {Index}/{Total} completed in {Duration}ms\n=== Translated Text ===\n{Translation}",
+                        "Response [{RequestId}] Success at {Timestamp}\nChunk {Index}/{Total} completed in {Duration}ms",
                         requestId,
                         DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                         chunkIndex,
                         chunks.Count,
-                        chunkStopwatch.ElapsedMilliseconds,
-                        translatedText);
+                        chunkStopwatch.ElapsedMilliseconds);
                 }
                 catch (Exception ex)
                 {

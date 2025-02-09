@@ -337,7 +337,6 @@ namespace genslation.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to cleanup temporary directory: {TempDir}", tempDir);
                 }
             }
         }
@@ -446,8 +445,6 @@ namespace genslation.Services
         {
             if (string.IsNullOrEmpty(chapter.OriginalContent))
             {
-                _logger.LogWarning("Original content missing for chapter: {ChapterId}", chapter.Id);
-                return BuildBasicChapterContent(chapter);
             }
 
             var doc = new HtmlDocument();
@@ -458,8 +455,6 @@ namespace genslation.Services
             {
                 if (string.IsNullOrEmpty(paragraph.NodePath))
                 {
-                    _logger.LogWarning("Node path missing for paragraph in chapter {ChapterId}", chapter.Id);
-                    continue;
                 }
 
                 var node = doc.DocumentNode.SelectSingleNode(paragraph.NodePath);
@@ -470,7 +465,6 @@ namespace genslation.Services
                 }
                 else
                 {
-                    _logger.LogWarning("Could not find node at path {Path} in chapter {ChapterId}", paragraph.NodePath, chapter.Id);
                 }
             }
 

@@ -1,7 +1,9 @@
 namespace genslation.Services;
 
 using System.Diagnostics;
+using System.Text.Json;
 using genslation.Models;
+using genslation.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
@@ -43,7 +45,9 @@ public class OpenAITranslationProvider : BaseTranslationProvider
                 Metrics = new TranslationMetrics
                 {
                     Provider = Name,
-                    TokenCount = await EstimateTokenCount(text)
+                    SourceTokenCount = await EstimateTokenCount(text),
+                    MaxQuota = options.MaxTokensPerRequest,
+                    ChapterTokenCounts = new Dictionary<string, int>()
                 }
             };
 
@@ -78,7 +82,55 @@ public class OpenAITranslationProvider : BaseTranslationProvider
                         return CreateErrorResult(text, $"Translation failed: {functionResult.Metadata["Error"]}");
                     }
 
-                    translatedChunks.Add(functionResult.GetValue<string>() ?? string.Empty);
+                    var translatedText = functionResult.GetValue<string>() ?? string.Empty;
+                    translatedChunks.Add(translatedText);
+
+                    // Update metrics with token usage
+                    if (functionResult.Metadata.TryGetValue("Usage", out var usageJson))
+                    {
+                        if (usageJson is string usageString && usageString.TrimStart().StartsWith("{"))
+                        {
+                            try
+                            {
+                                var usage = JsonSerializer.Deserialize<Dictionary<string, int>>(usageString);
+                                if (usage != null)
+                                {
+                                    var promptTokens = usage.GetValueOrDefault("PromptTokens", 0);
+                                    var completionTokens = usage.GetValueOrDefault("CompletionTokens", 0);
+                                    
+                                    result.Metrics.PromptTokens += promptTokens;
+                                    result.Metrics.CompletionTokens += completionTokens;
+                                    
+                                    // Track target tokens
+                                    var targetTokens = await EstimateTokenCount(translatedText);
+                                    result.Metrics.TargetTokenCount += targetTokens;
+                                    
+                                    // Update chunk-specific metrics
+                                    result.Metrics.ChapterTokenCounts[$"Chunk_{chunks.IndexOf(chunk) + 1}"] = targetTokens;
+                                    
+                                    // Update quota usage
+                                    result.Metrics.QuotaUsageRate = result.Metrics.TotalTokens / (double)result.Metrics.MaxQuota;
+                                    
+                                    // Cost calculation for OpenAI (gpt-3.5-turbo rates)
+                                    const double promptTokenRate = 0.0015 / 1000;
+                                    const double completionTokenRate = 0.002 / 1000;
+                                    result.Metrics.Cost += (promptTokens * promptTokenRate) + (completionTokens * completionTokenRate);
+
+                                    // Log progress
+                                    var progress = ((chunks.IndexOf(chunk) + 1) * 100.0) / chunks.Count;
+                                    // Suppress progress logging to avoid displaying translation prompts.
+                                }
+                            }
+                            catch (JsonException ex)
+                            {
+                            }
+                        }
+                        else
+                        {
+                        }
+                    }
+
+                    // TotalTokens is dynamically calculated; no need to assign it directly.
                 }
                 catch (Exception ex)
                 {
