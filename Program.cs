@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Serilog;
@@ -88,6 +88,16 @@ services.AddSingleton<ITranslationProvider>(sp =>
                 RetryDelay = TimeSpan.FromMilliseconds(settings.TranslationProvider.RetryDelayMilliseconds)
             });
     }
+});
+
+// Register default TranslationOptions
+services.AddSingleton(new TranslationOptions
+{
+    MaxTokensPerRequest = configService.Settings.TranslationProvider.MaxTokensPerRequest,
+    MaxRetries = configService.Settings.TranslationProvider.MaxRetries,
+    RetryDelay = TimeSpan.FromMilliseconds(configService.Settings.TranslationProvider.RetryDelayMilliseconds),
+    EnableTranslationMemory = configService.Settings.TranslationMemory.Enabled,
+    PreserveFormatting = configService.Settings.Epub.PreserveOriginalFormatting
 });
 
 services.AddSingleton<TranslationService>();
