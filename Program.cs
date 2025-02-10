@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿using Microsoft.Extensions.DependencyInjection;
+﻿﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Serilog;
@@ -7,8 +7,19 @@ using genslation.Interfaces;
 using genslation.Services;
 using genslation.Models;
 
+// Force auto-flush of console output
+Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+
+// Write to both console and file for debugging
+File.WriteAllText("debug.log", "Program starting...\n");
+Console.WriteLine("Program starting...");
+Console.Error.WriteLine("Program starting (stderr)...");
+
 try
 {
+    File.AppendAllText("debug.log", "Checking for appsettings.json...\n");
+    Console.WriteLine("Checking for appsettings.json...");
     // Check for appsettings.json and copy from sample if needed
     if (!File.Exists("appsettings.json") && File.Exists("appsettings.sample.json"))
     {
