@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿using Microsoft.Extensions.DependencyInjection;
+﻿﻿﻿﻿﻿﻿﻿﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Serilog;
@@ -265,7 +265,7 @@ For detailed configuration, modify appsettings.json in the program directory.");
             Console.WriteLine("\nTranslation Performance Metrics");
             Console.WriteLine("=============================");
             Console.WriteLine("Time and Processing");
-            Console.WriteLine($"  Total Time: {metrics.ProcessingTime.TotalMilliseconds:N0} ms");
+            Console.WriteLine($"  Total Time: {metrics.ProcessingTime.TotalSeconds:N2} seconds");
 
             if (metrics.ChapterTokenCounts.Any())
             {

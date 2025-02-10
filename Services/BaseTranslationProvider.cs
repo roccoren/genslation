@@ -1,5 +1,6 @@
 namespace genslation.Services;
 
+using System.Diagnostics;
 using System.Text.RegularExpressions;
 using genslation.Interfaces;
 using genslation.Models;
@@ -18,8 +19,8 @@ public abstract class BaseTranslationProvider : ITranslationProvider
 
     public abstract string Name { get; }
 
-    public abstract Task<TranslationResult> TranslateAsync(
-        string text,
+    public abstract Task<TranslationResult> TranslateChunkAsync(
+        string chunk,
         string sourceLanguage,
         string targetLanguage,
         TranslationOptions options,
@@ -29,8 +30,6 @@ public abstract class BaseTranslationProvider : ITranslationProvider
 
     public virtual async Task<int> EstimateTokenCount(string text)
     {
-        // Rough estimation based on words and characters
-        // This should be overridden by providers with more accurate counting
         var words = text.Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries).Length;
         var characters = text.Length;
         return (int)(words * 1.3 + characters * 0.1);
@@ -38,16 +37,12 @@ public abstract class BaseTranslationProvider : ITranslationProvider
 
     public virtual async Task<Dictionary<string, double>> GetLanguageConfidenceScores(string text)
     {
-        // Basic language detection logic
-        // Should be overridden by providers with better detection
         var scores = new Dictionary<string, double>();
-        
-        // Check for Chinese characters
+
         var chinesePercentage = (double)Regex.Matches(text, @"\p{IsCJKUnifiedIdeographs}").Count / text.Length;
         if (chinesePercentage > 0)
             scores["zh"] = chinesePercentage;
 
-        // Check for Latin characters (rough estimation for English)
         var englishPercentage = (double)Regex.Matches(text, @"[a-zA-Z]").Count / text.Length;
         if (englishPercentage > 0)
             scores["en"] = englishPercentage;
@@ -120,5 +115,119 @@ public abstract class BaseTranslationProvider : ITranslationProvider
             chunks.Add(string.Join(" ", currentChunk));
 
         return chunks;
+    }
+
+    protected virtual string CreateTranslationPrompt(
+        string text,
+        string sourceLanguage,
+        string targetLanguage,
+        TranslationOptions options)
+    {
+        return @$"You are a professional translator with expertise in {sourceLanguage} and {targetLanguage}.
+Please translate the following text from {sourceLanguage} to {targetLanguage}.
+Preserve all formatting, line breaks, and special characters.
+If there are technical terms or idioms, ensure they are translated appropriately for the target culture.
+
+Text to translate:
+{text}
+
+Requirements:
+- Maintain the original meaning and tone
+- Preserve formatting and structure
+- Ensure natural flow in the target language
+- Keep technical terms accurate
+- Maintain any markdown or HTML formatting if present
+
+Translation:";
+    }
+
+    public virtual async Task<TranslationResult> TranslateAsync(
+        string text,
+        string sourceLanguage,
+        string targetLanguage,
+        TranslationOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var estimatedTokens = await EstimateTokenCount(text);
+            var requestId = Guid.NewGuid().ToString("N");
+
+            _logger.LogInformation(
+                "Translation Request [{RequestId}] Started at {Timestamp}\nSource Language: {SourceLang}\nTarget Language: {TargetLang}\nEstimated Tokens: {Tokens}",
+                requestId,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                sourceLanguage,
+                targetLanguage,
+                estimatedTokens);
+
+            var result = new TranslationResult
+            {
+                OriginalContent = text,
+                Metrics = new TranslationMetrics
+                {
+                    Provider = Name,
+                    SourceTokenCount = estimatedTokens,
+                    MaxQuota = options.MaxTokensPerRequest,
+                    ChapterTokenCounts = new Dictionary<string, int>()
+                }
+            };
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return CreateErrorResult(text, "Empty text provided");
+            }
+
+            var chunks = await SplitIntoChunks(text, options.MaxTokensPerRequest);
+            _logger.LogInformation("[{RequestId}] Split text into {ChunkCount} chunks", requestId, chunks.Count);
+
+            var translatedChunks = new List<string>();
+            var chunkIndex = 0;
+
+            foreach (var chunk in chunks)
+            {
+                chunkIndex++;
+                try
+                {
+                    var translatedChunk = await TranslateChunkAsync(chunk, sourceLanguage, targetLanguage, options, cancellationToken);
+                    translatedChunks.Add(translatedChunk.TranslatedContent);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        "Response [{RequestId}] Error at {Timestamp}\nChunk {Index}/{Total}: {Error}",
+                        requestId,
+                        DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                        chunkIndex,
+                        chunks.Count,
+                        ex.Message);
+                    return CreateErrorResult(text, $"Translation failed: {ex.Message}");
+                }
+            }
+
+            stopwatch.Stop();
+            result.TranslatedContent = string.Join("", translatedChunks);
+            result.Success = true;
+            result.Metrics.ProcessingTime = stopwatch.Elapsed;
+
+            _logger.LogInformation(
+                "Translation [{RequestId}] Completed at {Timestamp}\nTotal Chunks: {Chunks}\nTotal Time: {Duration}ms",
+                requestId,
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                chunks.Count,
+                stopwatch.ElapsedMilliseconds);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Translation failed at {Timestamp}\nError: {Message}",
+                DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                ex.Message);
+            return CreateErrorResult(text, $"Translation failed: {ex.Message}");
+        }
     }
 }

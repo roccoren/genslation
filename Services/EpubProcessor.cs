@@ -16,6 +16,31 @@ namespace genslation.Services
 {
     public class EpubProcessor : IEpubProcessor
     {
+        private readonly ITranslationProvider _translationProvider;
+    
+        public EpubProcessor(ILogger<EpubProcessor> logger, ITranslationProvider translationProvider)
+        {
+            _logger = logger;
+            _translationProvider = translationProvider;
+        }
+    
+        public async Task<EpubDocument> TranslateDocumentAsync(EpubDocument document, string targetLanguage, TranslationOptions options)
+        {
+            foreach (var chapter in document.Chapters)
+            {
+                foreach (var paragraph in chapter.Paragraphs)
+                {
+                    var translationResult = await _translationProvider.TranslateAsync(
+                        paragraph.Content,
+                        document.Language,
+                        targetLanguage,
+                        options);
+        
+                    paragraph.TranslatedContent = translationResult.TranslatedContent;
+                }
+            }
+            return document;
+        }
         private readonly ILogger<EpubProcessor> _logger;
 
         public EpubProcessor(ILogger<EpubProcessor> logger)
