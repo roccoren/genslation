@@ -127,10 +127,70 @@ namespace genslation.Services
             var extension = Path.GetExtension(filePath).ToLowerInvariant();
             return extension switch
             {
-                ".jpg" or ".jpeg" or ".png" or ".gif" or ".svg" => ResourceType.Image,
-                ".ttf" or ".otf" or ".woff" or ".woff2" => ResourceType.Font,
-                ".css" => ResourceType.Stylesheet,
+                // Images
+                ".jpg" or ".jpeg" or ".png" or ".gif" or ".svg" or ".webp" => ResourceType.Image,
+                
+                // Fonts
+                ".ttf" or ".otf" or ".woff" or ".woff2" or ".eot" => ResourceType.Font,
+                
+                // Styles
+                ".css" or ".xpgt" or ".sass" or ".scss" => ResourceType.Stylesheet,
+                
+                // Scripts - preserve as Other type but with proper MIME handling
+                ".js" or ".mjs" => ResourceType.Other,
+                
+                // Media - preserve as Other type but with proper MIME handling
+                ".mp3" or ".m4a" or ".ogg" or ".wav" or
+                ".mp4" or ".webm" or ".ogv" => ResourceType.Other,
+                
+                // Misc binary files
+                ".bin" or ".dat" => ResourceType.Other,
+                
+                // Default
                 _ => ResourceType.Other
+            };
+        }
+
+        private string GetMimeType(string filePath)
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+            return extension switch
+            {
+                // Images
+                ".jpg" or ".jpeg" => "image/jpeg",
+                ".png" => "image/png",
+                ".gif" => "image/gif",
+                ".svg" => "image/svg+xml",
+                ".webp" => "image/webp",
+                
+                // Fonts
+                ".ttf" => "font/ttf",
+                ".otf" => "font/otf",
+                ".woff" => "font/woff",
+                ".woff2" => "font/woff2",
+                ".eot" => "application/vnd.ms-fontobject",
+                
+                // Styles
+                ".css" => "text/css",
+                ".xpgt" => "application/vnd.adobe-page-template+xml",
+                ".sass" or ".scss" => "text/x-sass",
+                
+                // Scripts
+                ".js" or ".mjs" => "application/javascript",
+                
+                // Audio
+                ".mp3" => "audio/mpeg",
+                ".m4a" => "audio/mp4",
+                ".ogg" => "audio/ogg",
+                ".wav" => "audio/wav",
+                
+                // Video
+                ".mp4" => "video/mp4",
+                ".webm" => "video/webm",
+                ".ogv" => "video/ogg",
+                
+                // Default
+                _ => "application/octet-stream"
             };
         }
 
@@ -344,43 +404,88 @@ namespace genslation.Services
         private async Task<List<EpubResource>> ExtractResourcesAsync(EpubBook book)
         {
             var resources = new List<EpubResource>();
-            
-            foreach (var htmlFile in book.Content.Html.Local)
+            var processedPaths = new HashSet<string>();
+
+            // Process standard content through EPUB reader
+            void AddResource(EpubLocalContentFile file, ResourceType defaultType)
             {
+                if (processedPaths.Contains(file.FilePath)) return;
+                processedPaths.Add(file.FilePath);
+
+                var resourceType = DetermineResourceType(file.FilePath);
+                byte[] data;
+                if (file is EpubLocalByteContentFile byteFile)
+                {
+                    data = byteFile.Content;
+                }
+                else
+                {
+                    data = Encoding.UTF8.GetBytes(((EpubLocalTextContentFile)file).Content);
+                }
+
                 resources.Add(new EpubResource
                 {
-                    Id = Path.GetFileNameWithoutExtension(htmlFile.FilePath),
-                    Path = htmlFile.FilePath,
-                    Data = Encoding.UTF8.GetBytes(htmlFile.Content),
-                    MimeType = "text/html",
-                    Type = ResourceType.Other
+                    Id = Path.GetFileNameWithoutExtension(file.FilePath),
+                    Path = file.FilePath,
+                    Data = data,
+                    MimeType = GetMimeType(file.FilePath) ?? file.ContentMimeType,
+                    Type = resourceType != ResourceType.Other ? resourceType : defaultType
                 });
             }
-            
-            foreach (var imageFile in book.Content.Images.Local)
+
+            // Process standard content types
+            foreach (var file in book.Content.Html.Local)
             {
-                resources.Add(new EpubResource
-                {
-                    Id = Path.GetFileNameWithoutExtension(imageFile.FilePath),
-                    Path = imageFile.FilePath,
-                    Data = ((EpubLocalByteContentFile)imageFile).Content,
-                    MimeType = imageFile.ContentMimeType,
-                    Type = ResourceType.Image
-                });
+                AddResource(file, ResourceType.Other);
             }
-            
-            foreach (var cssFile in book.Content.Css.Local)
+
+            foreach (var file in book.Content.Images.Local)
             {
-                resources.Add(new EpubResource
+                if (file is EpubLocalByteContentFile)
                 {
-                    Id = Path.GetFileNameWithoutExtension(cssFile.FilePath),
-                    Path = cssFile.FilePath,
-                    Data = Encoding.UTF8.GetBytes(cssFile.Content),
-                    MimeType = "text/css",
-                    Type = ResourceType.Stylesheet
-                });
+                    AddResource(file, ResourceType.Image);
+                }
             }
-            
+
+            foreach (var file in book.Content.Css.Local)
+            {
+                AddResource(file, ResourceType.Stylesheet);
+            }
+
+            // Preserve any additional files from the EPUB archive
+            try
+            {
+                using var archive = ZipFile.OpenRead(book.FilePath);
+                foreach (var entry in archive.Entries)
+                {
+                    if (string.IsNullOrEmpty(entry.Name) || processedPaths.Contains(entry.FullName))
+                    {
+                        continue;
+                    }
+
+                    using var stream = entry.Open();
+                    using var ms = new MemoryStream();
+                    await stream.CopyToAsync(ms);
+                    var data = ms.ToArray();
+
+                    var resourceType = DetermineResourceType(entry.FullName);
+                    resources.Add(new EpubResource
+                    {
+                        Id = Path.GetFileNameWithoutExtension(entry.FullName),
+                        Path = entry.FullName,
+                        Data = data,
+                        MimeType = GetMimeType(entry.FullName),
+                        Type = resourceType
+                    });
+
+                    processedPaths.Add(entry.FullName);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error processing additional files from EPUB archive");
+            }
+
             return resources;
         }
 
