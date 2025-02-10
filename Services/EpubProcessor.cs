@@ -604,7 +604,26 @@ namespace genslation.Services
         private string EnsureProperXhtmlTags(string content)
         {
             // Ensure link tags are properly self-closing
-            return Regex.Replace(content, @"<link([^>]+?)>(?:</link>)?", "<link$1 />");
+            content = Regex.Replace(content, @"<link([^>]+?)>(?:</link>)?", "<link$1 />");
+        
+            // Ensure all tags have corresponding closure tags
+            var doc = new HtmlDocument();
+            doc.LoadHtml(content);
+        
+            // Iterate through all nodes to find unclosed tags
+            foreach (var node in doc.DocumentNode.DescendantsAndSelf())
+            {
+                // List of known self-closing tags
+                var selfClosingTags = new HashSet<string> { "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr" };
+        
+                if (!node.Closed && !selfClosingTags.Contains(node.Name.ToLower()))
+                {
+                    // Append the appropriate closing tag
+                    content += $"</{node.Name}>";
+                }
+            }
+        
+            return content;
         }
 
         private string BuildBasicChapterContent(EpubChapter chapter)
