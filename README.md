@@ -41,6 +41,18 @@ cp appsettings.sample.json appsettings.json
 
 This project uses GitHub Actions with a self-hosted Linux x64 runner for building and releasing cross-platform packages.
 
+### GitHub Token Permissions
+
+The workflow uses `GITHUB_TOKEN` which is automatically provided by GitHub Actions. To ensure it has the correct permissions:
+
+1. Go to your GitHub repository
+2. Navigate to Settings > Actions > General
+3. Scroll down to "Workflow permissions"
+4. Select "Read and write permissions"
+5. Save the changes
+
+This allows the workflow to create releases and upload artifacts using the automatically provided `GITHUB_TOKEN`.
+
 ### Setting Up a Self-Hosted Runner
 
 1. On your Linux x64 machine, create a directory for the runner:

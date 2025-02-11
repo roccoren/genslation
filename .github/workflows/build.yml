@@ -5,6 +5,9 @@ on:
     tags:
       - 'release/*'
 
+permissions:
+  contents: write # Required for creating releases and uploading assets
+
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
