@@ -14,6 +14,8 @@
     <Product>Genslation</Product>
     <Description>A tool for translating EPUB files</Description>
     <Copyright>Copyright © 2024</Copyright>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
 
     <!-- Build Configuration -->
     <RuntimeIdentifiers>win-x64;linux-x64;osx-x64;osx-arm64</RuntimeIdentifiers>
