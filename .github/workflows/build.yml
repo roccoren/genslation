@@ -1,0 +1,67 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'release/*'
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  build-and-release:
+    runs-on: self-hosted
+    
+    # Ensure we're on a Linux x64 runner
+    steps:
+    - name: Check runner environment
+      run: |
+        if [ "$(uname)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+          echo "This workflow requires a Linux x64 runner"
+          exit 1
+        fi
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 9.0.x
+        
+    - name: Extract version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/release/}" >> $GITHUB_OUTPUT
+        
+    - name: Restore dependencies
+      run: dotnet restore
+      
+    - name: Run tests
+      run: dotnet test --verbosity normal --configuration Release
+
+    - name: Build and publish Windows x64
+      run: dotnet publish -c Release -r win-x64 --self-contained true
+      
+    - name: Build and publish Linux x64  
+      run: dotnet publish -c Release -r linux-x64 --self-contained true
+      
+    - name: Build and publish macOS x64
+      run: dotnet publish -c Release -r osx-x64 --self-contained true
+      
+    - name: Build and publish macOS ARM64
+      run: dotnet publish -c Release -r osx-arm64 --self-contained true
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ steps.get_version.outputs.VERSION }}
+        tag_name: ${{ github.ref }}
+        files: builds/*.zip
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
