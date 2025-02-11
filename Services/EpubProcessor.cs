@@ -312,10 +312,7 @@ namespace genslation.Services
                     Author = string.Join("; ", book.AuthorList),
                     Language = book.Schema.Package.Metadata.Languages.FirstOrDefault()?.ToString() ?? string.Empty,
                     FilePath = filePath,
-                    CoverImage = book.CoverImage,
-                    TableOfContents = MapNavigationItems(book.Navigation),
-                    Resources = await ExtractResourcesAsync(book),
-                    Chapters = await LoadChaptersAsync(book)
+                    Chapters = await ExtractChaptersAsync(book)
                 };
                 return document;
             }
@@ -794,14 +791,14 @@ namespace genslation.Services
                     Id = Guid.NewGuid().ToString(),
                     Title = Path.GetFileNameWithoutExtension(item.FilePath),
                     OriginalPath = item.FilePath,
-                    OriginalContent = item.Content, // Store the complete original HTML
-                    Paragraphs = ParseParagraphs(item.Content)
+                    OriginalContent = item.Content,
+                    Paragraphs = ExtractParagraphs(item.Content)
                 });
             }
             return chapters;
         }
 
-        private List<EpubParagraph> ParseParagraphs(string htmlContent)
+        private List<EpubParagraph> ExtractParagraphs(string htmlContent)
         {
             var paragraphs = new List<EpubParagraph>();
             var doc = new HtmlDocument();
@@ -815,30 +812,88 @@ namespace genslation.Services
             {
                 if (string.IsNullOrWhiteSpace(node.InnerText)) continue;
 
-                var type = node.Name.ToLower() switch
-                {
-                    "h1" => ParagraphType.Heading1,
-                    "h2" => ParagraphType.Heading2,
-                    "h3" => ParagraphType.Heading3,
-                    "h4" => ParagraphType.Heading4,
-                    "h5" => ParagraphType.Heading5,
-                    "h6" => ParagraphType.Heading6,
-                    _ => ParagraphType.Text
-                };
+                // Store all attributes for preservation
+                var attributes = node.Attributes.ToDictionary(
+                    attr => attr.Name,
+                    attr => attr.Value
+                );
 
                 paragraphs.Add(new EpubParagraph
                 {
+                    Id = Guid.NewGuid().ToString(),
                     Content = node.InnerText.Trim(),
                     OriginalHtml = node.OuterHtml,
-                    Type = type,
-                    NodePath = node.XPath // Store XPath for later reconstruction
+                    NodePath = node.XPath,
+                    Metadata = attributes
                 });
             }
 
             return paragraphs;
         }
 
-        private string RebuildChapterContent(EpubChapter chapter)
+        public async Task<bool> SaveTranslatedEpubAsync(EpubDocument document, string outputPath, TranslationOptions options)
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            try
+            {
+                Directory.CreateDirectory(tempDir);
+                ZipFile.ExtractToDirectory(document.FilePath, tempDir);
+
+                foreach (var chapter in document.Chapters)
+                {
+                    var chapterPath = Path.Combine(tempDir, chapter.OriginalPath);
+                    if (!File.Exists(chapterPath)) continue;
+
+                    var translatedContent = await RebuildChapterContentAsync(chapter);
+                    await File.WriteAllTextAsync(chapterPath, translatedContent, new UTF8Encoding(false));
+                }
+
+                if (File.Exists(outputPath))
+                {
+                    File.Delete(outputPath);
+                }
+
+                using (var zipStream = new FileStream(outputPath, FileMode.Create))
+                using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
+                {
+                    // First file must be mimetype with no compression
+                    var mimetypeEntry = archive.CreateEntry("mimetype", CompressionLevel.NoCompression);
+                    using (var writer = new StreamWriter(mimetypeEntry.Open()))
+                    {
+                        writer.Write("application/epub+zip");
+                    }
+
+                    // Add all other files
+                    foreach (var filePath in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
+                    {
+                        if (Path.GetFileName(filePath).ToLower() == "mimetype") continue;
+
+                        var relativePath = Path.GetRelativePath(tempDir, filePath).Replace("\\", "/");
+                        var entry = archive.CreateEntry(relativePath, CompressionLevel.Optimal);
+                        using (var entryStream = entry.Open())
+                        using (var fileStream = File.OpenRead(filePath))
+                        {
+                            fileStream.CopyTo(entryStream);
+                        }
+                    }
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save translated EPUB");
+                return false;
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        private async Task<string> RebuildChapterContentAsync(EpubChapter chapter)
         {
             if (string.IsNullOrEmpty(chapter.OriginalContent))
             {
@@ -849,7 +904,6 @@ namespace genslation.Services
             var doc = new HtmlDocument();
             doc.LoadHtml(chapter.OriginalContent);
 
-            // Update translatable nodes while preserving structure
             foreach (var paragraph in chapter.Paragraphs)
             {
                 try
@@ -907,56 +961,44 @@ namespace genslation.Services
 
         private string EnsureProperXhtmlTags(string content)
         {
-            // Ensure link tags are properly self-closing
-            content = Regex.Replace(content, @"<link([^>]+?)>(?:</link>)?", "<link$1 />");
-        
-            // Ensure all tags have corresponding closure tags
-            var doc = new HtmlDocument();
-            doc.LoadHtml(content);
-        
-            // Iterate through all nodes to find unclosed tags
-            foreach (var node in doc.DocumentNode.DescendantsAndSelf())
+            var selfClosingTags = new[]
             {
-                // List of known self-closing tags
-                var selfClosingTags = new HashSet<string> { "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr" };
-        
-                if (!node.Closed && !selfClosingTags.Contains(node.Name.ToLower()))
+                "img", "br", "hr", "input", "link", "meta",
+                "area", "base", "col", "embed", "param",
+                "source", "track", "wbr"
+            };
+
+            // Convert all self-closing tags to proper XHTML format
+            foreach (var tag in selfClosingTags)
+            {
+                // Match tags with or without attributes, not already properly closed
+                var pattern = $@"<{tag}([^>]*[^/])>";
+                content = Regex.Replace(content, pattern, m =>
                 {
-                    // Append the appropriate closing tag
-                    content += $"</{node.Name}>";
-                }
+                    var attrs = m.Groups[1].Value.Trim();
+                    return $"<{tag}{(attrs.Length > 0 ? " " + attrs : "")} />";
+                });
             }
-        
+
             return content;
         }
 
-        private string BuildBasicChapterContent(EpubChapter chapter)
+        public async Task<List<EpubChapter>> ExtractChaptersAsync(EpubDocument document)
         {
-            var content = new StringBuilder();
-            content.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
-            content.AppendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\">");
-            content.AppendLine("<head>");
-            content.AppendLine($"<title>{chapter.Title}</title>");
-            content.AppendLine("<link rel=\"stylesheet\" type=\"text/css\" href=\"styles.css\" />");
-            content.AppendLine("</head>");
-            content.AppendLine("<body>");
-            foreach (var paragraph in chapter.Paragraphs)
-            {
-                var tag = paragraph.Type switch
-                {
-                    ParagraphType.Heading1 => "h1",
-                    ParagraphType.Heading2 => "h2",
-                    ParagraphType.Heading3 => "h3",
-                    ParagraphType.Heading4 => "h4",
-                    ParagraphType.Heading5 => "h5",
-                    ParagraphType.Heading6 => "h6",
-                    _ => "p"
-                };
-                content.AppendLine($"<{tag}>{paragraph.TranslatedContent ?? paragraph.Content}</{tag}>");
-            }
-            content.AppendLine("</body>");
-            content.AppendLine("</html>");
-            return content.ToString();
+            var book = await EpubReader.ReadBookAsync(document.FilePath);
+            return await ExtractChaptersAsync(book);
+        }
+
+        public async Task<bool> ValidateStructureAsync(EpubDocument document)
+        {
+            return !string.IsNullOrEmpty(document.FilePath) && 
+                   File.Exists(document.FilePath) && 
+                   document.Chapters.Any();
+        }
+
+        public async Task<bool> ValidateOutputAsync(string filePath)
+        {
+            return File.Exists(filePath);
         }
 
         public async Task<Dictionary<string, string>> ExtractMetadataAsync(string filePath)
