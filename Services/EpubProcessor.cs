@@ -16,36 +16,48 @@ namespace genslation.Services
 {
     public class EpubProcessor : IEpubProcessor
     {
+        private readonly ILogger<EpubProcessor> _logger;
         private readonly ITranslationProvider _translationProvider;
     
         public EpubProcessor(ILogger<EpubProcessor> logger, ITranslationProvider translationProvider)
         {
             _logger = logger;
-            _translationProvider = translationProvider;
+            _translationProvider = translationProvider ?? throw new ArgumentNullException(nameof(translationProvider));
         }
     
         public async Task<EpubDocument> TranslateDocumentAsync(EpubDocument document, string targetLanguage, TranslationOptions options)
         {
+            if (document == null) throw new ArgumentNullException(nameof(document));
+            if (string.IsNullOrEmpty(targetLanguage)) throw new ArgumentException("Target language cannot be empty", nameof(targetLanguage));
+            if (options == null) throw new ArgumentNullException(nameof(options));
+
+            _logger.LogInformation("Starting document translation to {TargetLanguage}", targetLanguage);
+            
             foreach (var chapter in document.Chapters)
             {
+                _logger.LogInformation("Translating chapter: {ChapterTitle}", chapter.Title);
                 foreach (var paragraph in chapter.Paragraphs)
                 {
-                    var translationResult = await _translationProvider.TranslateAsync(
-                        paragraph.Content,
-                        document.Language,
-                        targetLanguage,
-                        options);
-        
-                    paragraph.TranslatedContent = translationResult.TranslatedContent;
+                    try
+                    {
+                        var translationResult = await _translationProvider.TranslateAsync(
+                            paragraph.Content,
+                            document.Language,
+                            targetLanguage,
+                            options);
+            
+                        paragraph.TranslatedContent = translationResult.TranslatedContent;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to translate paragraph in chapter {ChapterTitle}", chapter.Title);
+                        throw;
+                    }
                 }
             }
-            return document;
-        }
-        private readonly ILogger<EpubProcessor> _logger;
 
-        public EpubProcessor(ILogger<EpubProcessor> logger)
-        {
-            _logger = logger;
+            _logger.LogInformation("Document translation completed");
+            return document;
         }
 
         public async Task<List<EpubChapter>> ExtractChaptersAsync(EpubDocument document)
@@ -81,14 +93,21 @@ namespace genslation.Services
 
         private List<genslation.Models.EpubNavigationItem> MapNavigationItems(IReadOnlyList<VersOne.Epub.EpubNavigationItem> navigationItems)
         {
+            if (navigationItems == null)
+            {
+                return new List<genslation.Models.EpubNavigationItem>();
+            }
+
             var result = new List<genslation.Models.EpubNavigationItem>();
             foreach (var item in navigationItems)
             {
+                if (item == null) continue;
+
                 result.Add(new genslation.Models.EpubNavigationItem
                 {
-                    Title = item.Title,
+                    Title = item.Title ?? string.Empty,
                     Source = item.Link?.ContentFilePath ?? string.Empty,
-                    Children = MapNavigationItems(item.NestedItems)
+                    Children = MapNavigationItems(item.NestedItems ?? new List<VersOne.Epub.EpubNavigationItem>())
                 });
             }
             return result;
@@ -422,6 +441,7 @@ namespace genslation.Services
                 }
                 catch (Exception ex)
                 {
+                    _logger.LogWarning(ex, "Failed to clean up temporary directory: {TempDir}. Manual cleanup may be required.", tempDir);
                 }
             }
         }
@@ -478,6 +498,18 @@ namespace genslation.Services
             }
 
             // Preserve any additional files from the EPUB archive
+            if (string.IsNullOrEmpty(book?.FilePath))
+            {
+                _logger.LogWarning("Book file path is null or empty");
+                return resources;
+            }
+
+            if (!File.Exists(book.FilePath))
+            {
+                _logger.LogWarning("Book file does not exist at path: {FilePath}", book.FilePath);
+                return resources;
+            }
+
             try
             {
                 using var archive = ZipFile.OpenRead(book.FilePath);
@@ -575,6 +607,8 @@ namespace genslation.Services
         {
             if (string.IsNullOrEmpty(chapter.OriginalContent))
             {
+                _logger.LogWarning("Original content is empty for chapter {ChapterTitle}. Using basic content template.", chapter.Title);
+                return BuildBasicChapterContent(chapter);
             }
 
             var doc = new HtmlDocument();
@@ -585,6 +619,10 @@ namespace genslation.Services
             {
                 if (string.IsNullOrEmpty(paragraph.NodePath))
                 {
+                    _logger.LogWarning("Missing node path for paragraph in chapter {ChapterTitle}. Content: {Content}",
+                        chapter.Title,
+                        paragraph.Content?.Substring(0, Math.Min(50, paragraph.Content?.Length ?? 0)));
+                    continue;
                 }
 
                 var node = doc.DocumentNode.SelectSingleNode(paragraph.NodePath);
@@ -595,10 +633,21 @@ namespace genslation.Services
                 }
                 else
                 {
+                    _logger.LogWarning("Node not found at path {NodePath} in chapter {ChapterTitle}",
+                        paragraph.NodePath,
+                        chapter.Title);
                 }
             }
 
-            return EnsureProperXhtmlTags(doc.DocumentNode.OuterHtml);
+            var result = EnsureProperXhtmlTags(doc.DocumentNode.OuterHtml);
+            
+            if (string.IsNullOrEmpty(result))
+            {
+                _logger.LogWarning("Failed to rebuild chapter content for {ChapterTitle}. Using basic content template.", chapter.Title);
+                return BuildBasicChapterContent(chapter);
+            }
+
+            return result;
         }
 
         private string EnsureProperXhtmlTags(string content)
@@ -674,43 +723,66 @@ namespace genslation.Services
             }
         }
 
-        public async Task<bool> ValidateStructureAsync(EpubDocument document)
+        public Task<bool> ValidateStructureAsync(EpubDocument document)
         {
+            if (document == null)
+            {
+                _logger.LogError("Document is null");
+                return Task.FromResult(false);
+            }
+
             if (string.IsNullOrEmpty(document.FilePath) || !File.Exists(document.FilePath))
             {
                 _logger.LogError("Invalid file path: {FilePath}", document.FilePath);
-                return false;
+                return Task.FromResult(false);
             }
 
-            if (!document.Chapters.Any())
+            if (!document.Chapters?.Any() ?? true)
             {
                 _logger.LogError("No chapters found in EPUB document.");
-                return false;
+                return Task.FromResult(false);
             }
 
-            return true;
+            return Task.FromResult(true);
         }
 
-        public async Task<bool> ValidateOutputAsync(string filePath)
+        public Task<bool> ValidateOutputAsync(string filePath)
         {
+            if (string.IsNullOrEmpty(filePath))
+            {
+                _logger.LogError("Output file path is null or empty");
+                return Task.FromResult(false);
+            }
+
             if (!File.Exists(filePath))
             {
                 _logger.LogError("Output file does not exist: {FilePath}", filePath);
-                return false;
+                return Task.FromResult(false);
             }
 
-            return true;
+            return Task.FromResult(true);
         }
 
-        public async Task<byte[]> GeneratePreviewAsync(EpubDocument document, int chapterIndex = 0)
+        public Task<byte[]> GeneratePreviewAsync(EpubDocument document, int chapterIndex = 0)
         {
-            if (chapterIndex >= document.Chapters.Count)
+            if (document == null)
             {
-                throw new ArgumentException("Invalid chapter index.");
+                throw new ArgumentNullException(nameof(document));
+            }
+
+            if (document.Chapters == null || document.Chapters.Count == 0)
+            {
+                throw new InvalidOperationException("Document has no chapters");
+            }
+
+            if (chapterIndex < 0 || chapterIndex >= document.Chapters.Count)
+            {
+                throw new ArgumentOutOfRangeException(nameof(chapterIndex),
+                    $"Invalid chapter index: {chapterIndex}. Document has {document.Chapters.Count} chapter(s).");
             }
 
             var chapter = document.Chapters[chapterIndex];
-            return Encoding.UTF8.GetBytes(RebuildChapterContent(chapter));
+            return Task.FromResult(Encoding.UTF8.GetBytes(RebuildChapterContent(chapter)));
         }
     }
 }
