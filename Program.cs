@@ -1,4 +1,4 @@
-﻿﻿using Microsoft.Extensions.DependencyInjection;
+﻿﻿﻿﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Serilog;
@@ -125,6 +125,7 @@ For detailed configuration, modify appsettings.json in the program directory.");
     // Add configuration and settings
     services.AddSingleton(configService);
     services.AddSingleton(settings);
+    services.AddSingleton(settings.Epub); // Register EpubSettings separately
 
     // Configure Semantic Kernel
     var kernelBuilder = Kernel.CreateBuilder();

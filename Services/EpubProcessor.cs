@@ -1,11 +1,14 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
+using genslation.Configuration;
 using genslation.Interfaces;
 using genslation.Models;
 using HtmlAgilityPack;
@@ -18,11 +21,23 @@ namespace genslation.Services
     {
         private readonly ILogger<EpubProcessor> _logger;
         private readonly ITranslationProvider _translationProvider;
+        private readonly ConcurrencySettings _concurrencySettings;
+
+        private static int CountWords(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return 0;
+            return text.Split(new[] { ' ', '\t', '\n', '\r' },
+                StringSplitOptions.RemoveEmptyEntries).Length;
+        }
     
-        public EpubProcessor(ILogger<EpubProcessor> logger, ITranslationProvider translationProvider)
+        public EpubProcessor(
+            ILogger<EpubProcessor> logger,
+            ITranslationProvider translationProvider,
+            EpubSettings epubSettings)
         {
             _logger = logger;
             _translationProvider = translationProvider ?? throw new ArgumentNullException(nameof(translationProvider));
+            _concurrencySettings = epubSettings?.Concurrency ?? throw new ArgumentNullException(nameof(epubSettings));
         }
     
         public async Task<EpubDocument> TranslateDocumentAsync(EpubDocument document, string targetLanguage, TranslationOptions options)
@@ -32,32 +47,252 @@ namespace genslation.Services
             if (options == null) throw new ArgumentNullException(nameof(options));
 
             _logger.LogInformation("Starting document translation to {TargetLanguage}", targetLanguage);
+
+            var failedParagraphs = new ConcurrentBag<(EpubChapter Chapter, EpubParagraph Paragraph, Exception Error)>();
+            var metrics = new ConcurrentDictionary<string, TranslationMetrics>();
             
+            // Create rate limiters from configuration
+            var rateLimiters = _concurrencySettings.WordCountThresholds.ToDictionary(
+                kvp => kvp.Key,
+                kvp => (
+                    Limiter: new SemaphoreSlim(kvp.Value.Threads),
+                    Description: kvp.Value.Description
+                )
+            );
+
+            _logger.LogInformation("Initialized translation pipeline with the following concurrency levels:");
+            foreach (var (threshold, level) in _concurrencySettings.WordCountThresholds.OrderBy(x => x.Key))
+            {
+                _logger.LogInformation(
+                    "- Up to {Threshold} words: {Threads} threads ({Description})",
+                    threshold == int.MaxValue ? "∞" : threshold.ToString(),
+                    level.Threads,
+                    level.Description);
+            }
+
             foreach (var chapter in document.Chapters)
             {
                 _logger.LogInformation("Translating chapter: {ChapterTitle}", chapter.Title);
-                foreach (var paragraph in chapter.Paragraphs)
+                
+                // Group paragraphs into batches based on length and token count
+                var batches = await CreateParagraphBatches(chapter.Paragraphs, options.MaxTokensPerRequest);
+
+                // Group batches by word count threshold for parallel processing
+                var batchesByWordCount = batches
+                    .Select(batch =>
+                    {
+                        var maxWords = batch.Max(p => CountWords(p.Content));
+                        var threshold = _concurrencySettings.WordCountThresholds.Keys
+                            .OrderBy(t => t)
+                            .First(t => maxWords <= t);
+                        return (Batch: batch, Threshold: threshold);
+                    })
+                    .GroupBy(b => b.Threshold)
+                    .ToDictionary(g => g.Key, g => g.Select(b => b.Batch).ToList());
+
+                // Process each word count group with its own concurrency limit
+                foreach (var wordGroup in batchesByWordCount)
                 {
-                    try
+                    var threshold = wordGroup.Key;
+                    var batchesInGroup = wordGroup.Value;
+                    var (rateLimiter, description) = rateLimiters[threshold];
+                    var concurrencyLevel = _concurrencySettings.WordCountThresholds[threshold];
+
+                    var message = $"Processing {batchesInGroup.Count} batches of {concurrencyLevel.Description} " +
+                                $"with concurrency {concurrencyLevel.Threads}";
+                    _logger.LogInformation(message);
+
+                    var tasks = batchesInGroup.Select(async batch =>
                     {
-                        var translationResult = await _translationProvider.TranslateAsync(
-                            paragraph.Content,
-                            document.Language,
-                            targetLanguage,
-                            options);
-            
-                        paragraph.TranslatedContent = translationResult.TranslatedContent;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to translate paragraph in chapter {ChapterTitle}", chapter.Title);
-                        throw;
-                    }
+                        await rateLimiter.WaitAsync();
+                        try
+                        {
+                            await ProcessBatch(batch, chapter, document.Language, targetLanguage, options, metrics, failedParagraphs);
+                            
+                            // Log detailed metrics about processed batch
+                            var avgWords = batch.Average(p => CountWords(p.Content));
+                            _logger.LogDebug($"Completed batch processing: {description}, Average words: {avgWords:F1}");
+                        }
+                        finally
+                        {
+                            rateLimiter.Release();
+                            await Task.Delay(TimeSpan.FromMilliseconds(concurrencyLevel.DelayMs));
+                        }
+                    });
+
+                    // Wait for all batches in this word count group to complete
+                    await Task.WhenAll(tasks);
+                    
+                    _logger.LogInformation(
+                        "Completed processing {Description} batch group",
+                        description);
+                }
+
+                // Log chapter progress
+                var chapterMetrics = metrics.GetOrAdd(chapter.Title, new TranslationMetrics());
+                _logger.LogInformation(
+                    "Chapter {ChapterTitle} completed. Processed {TokenCount} tokens in {Time:n2} seconds",
+                    chapter.Title,
+                    chapterMetrics.TotalTokens,
+                    chapterMetrics.ProcessingTime.TotalSeconds);
+            }
+
+            // Handle any failed paragraphs
+            if (failedParagraphs.Any())
+            {
+                _logger.LogWarning("Retrying {Count} failed paragraphs", failedParagraphs.Count);
+                await RetryFailedParagraphs(failedParagraphs, document.Language, targetLanguage, options);
+            }
+
+            // Log final metrics
+            var totalProcessingTime = TimeSpan.FromSeconds(metrics.Values.Sum(m => m.ProcessingTime.TotalSeconds));
+            var totalPromptTokens = metrics.Values.Sum(m => m.PromptTokens);
+            var totalCompletionTokens = metrics.Values.Sum(m => m.CompletionTokens);
+            var totalRetries = metrics.Values.Sum(m => m.RetryCount);
+
+            _logger.LogInformation(
+                "Document translation completed. Tokens (Prompt: {PromptTokens}, Completion: {CompletionTokens}), " +
+                "Processing time: {Time:n2}s, Retries: {Retries}",
+                totalPromptTokens,
+                totalCompletionTokens,
+                totalProcessingTime.TotalSeconds,
+                totalRetries);
+
+            return document;
+        }
+
+        private async Task<List<List<EpubParagraph>>> CreateParagraphBatches(List<EpubParagraph> paragraphs, int maxTokensPerBatch)
+        {
+            var batches = new List<List<EpubParagraph>>();
+            var currentBatch = new List<EpubParagraph>();
+            var currentTokenCount = 0;
+
+            foreach (var paragraph in paragraphs)
+            {
+                var tokens = await _translationProvider.EstimateTokenCount(paragraph.Content);
+                
+                if (currentTokenCount + tokens > maxTokensPerBatch && currentBatch.Any())
+                {
+                    batches.Add(currentBatch);
+                    currentBatch = new List<EpubParagraph>();
+                    currentTokenCount = 0;
+                }
+
+                currentBatch.Add(paragraph);
+                currentTokenCount += tokens;
+            }
+
+            if (currentBatch.Any())
+            {
+                batches.Add(currentBatch);
+            }
+
+            return batches;
+        }
+
+        private async Task ProcessBatch(
+            List<EpubParagraph> batch,
+            EpubChapter chapter,
+            string sourceLanguage,
+            string targetLanguage,
+            TranslationOptions options,
+            ConcurrentDictionary<string, TranslationMetrics> metrics,
+            ConcurrentBag<(EpubChapter, EpubParagraph, Exception)> failedParagraphs)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            foreach (var paragraph in batch)
+            {
+                try
+                {
+                    var translationResult = await _translationProvider.TranslateAsync(
+                        paragraph.Content,
+                        sourceLanguage,
+                        targetLanguage,
+                        options);
+
+                    paragraph.TranslatedContent = translationResult.TranslatedContent;
+
+                    // Update metrics thread-safely
+                    metrics.AddOrUpdate(
+                        chapter.Title,
+                        _ => new TranslationMetrics
+                        {
+                            PromptTokens = translationResult.Metrics.PromptTokens,
+                            CompletionTokens = translationResult.Metrics.CompletionTokens,
+                            ProcessingTime = translationResult.Metrics.ProcessingTime
+                        },
+                        (_, existing) =>
+                        {
+                            var updated = new TranslationMetrics
+                            {
+                                PromptTokens = existing.PromptTokens + translationResult.Metrics.PromptTokens,
+                                CompletionTokens = existing.CompletionTokens + translationResult.Metrics.CompletionTokens,
+                                ProcessingTime = existing.ProcessingTime + translationResult.Metrics.ProcessingTime
+                            };
+                            return updated;
+                        });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to translate paragraph in chapter {ChapterTitle}", chapter.Title);
+                    failedParagraphs.Add((chapter, paragraph, ex));
                 }
             }
 
-            _logger.LogInformation("Document translation completed");
-            return document;
+            sw.Stop();
+            var batchMetrics = metrics.GetOrAdd(chapter.Title, new TranslationMetrics());
+            batchMetrics.ProcessingTime += sw.Elapsed;
+        }
+
+        private async Task RetryFailedParagraphs(
+            ConcurrentBag<(EpubChapter Chapter, EpubParagraph Paragraph, Exception Error)> failedParagraphs,
+            string sourceLanguage,
+            string targetLanguage,
+            TranslationOptions options)
+        {
+            foreach ((EpubChapter chapter, EpubParagraph paragraph, Exception error) in failedParagraphs)
+            {
+                for (int retry = 0; retry < options.MaxRetries; retry++)
+                {
+                    try
+                    {
+                        _logger.LogInformation(
+                            "Retry {Attempt}/{MaxRetries} for paragraph in chapter {ChapterTitle}",
+                            retry + 1,
+                            options.MaxRetries,
+                            chapter.Title);
+
+                        var translationResult = await _translationProvider.TranslateAsync(
+                            paragraph.Content,
+                            sourceLanguage,
+                            targetLanguage,
+                            options);
+
+                        paragraph.TranslatedContent = translationResult.TranslatedContent;
+                        break;
+                    }
+                    catch (Exception retryEx)
+                    {
+                        _logger.LogError(retryEx,
+                            "Retry {Attempt}/{MaxRetries} failed for paragraph in chapter {ChapterTitle}",
+                            retry + 1,
+                            options.MaxRetries,
+                            chapter.Title);
+
+                        if (retry == options.MaxRetries - 1)
+                        {
+                            // If all retries fail, preserve original content
+                            paragraph.TranslatedContent = paragraph.Content;
+                            _logger.LogError("All retries failed for paragraph. Preserving original content.");
+                        }
+                        else
+                        {
+                            await Task.Delay(options.RetryDelay);
+                        }
+                    }
+                }
+            }
         }
 
         public async Task<List<EpubChapter>> ExtractChaptersAsync(EpubDocument document)
@@ -572,11 +807,11 @@ namespace genslation.Services
             var doc = new HtmlDocument();
             doc.LoadHtml(htmlContent);
 
-            var textNodes = doc.DocumentNode.SelectNodes("//p|//h1|//h2|//h3|//h4|//h5|//h6|//div[normalize-space()]");
+            var textNodes = doc.DocumentNode.SelectNodes("//body//p|//body//h1|//body//h2|//body//h3|//body//h4|//body//h5|//body//h6|//body//div[not(p) and normalize-space()]");
             
             if (textNodes == null) return paragraphs;
 
-            foreach (var node in textNodes)
+            foreach (var node in textNodes.Where(n => !string.IsNullOrWhiteSpace(n.InnerText)))
             {
                 if (string.IsNullOrWhiteSpace(node.InnerText)) continue;
 
@@ -617,25 +852,45 @@ namespace genslation.Services
             // Update translatable nodes while preserving structure
             foreach (var paragraph in chapter.Paragraphs)
             {
-                if (string.IsNullOrEmpty(paragraph.NodePath))
+                try
                 {
-                    _logger.LogWarning("Missing node path for paragraph in chapter {ChapterTitle}. Content: {Content}",
-                        chapter.Title,
-                        paragraph.Content?.Substring(0, Math.Min(50, paragraph.Content?.Length ?? 0)));
-                    continue;
-                }
+                    if (string.IsNullOrEmpty(paragraph.NodePath))
+                    {
+                        _logger.LogWarning("Missing node path for paragraph in chapter {ChapterTitle}. Content: {Content}",
+                            chapter.Title,
+                            paragraph.Content?.Substring(0, Math.Min(50, paragraph.Content?.Length ?? 0)));
+                        continue;
+                    }
 
-                var node = doc.DocumentNode.SelectSingleNode(paragraph.NodePath);
-                if (node != null)
-                {
-                    // Preserve attributes and surrounding HTML structure
-                    node.InnerHtml = paragraph.TranslatedContent ?? paragraph.Content;
+                    // Try exact path first
+                    var node = doc.DocumentNode.SelectSingleNode(paragraph.NodePath);
+                    
+                    // If not found, try searching by content
+                    if (node == null)
+                    {
+                        var nodes = doc.DocumentNode.SelectNodes("//body//p|//body//h1|//body//h2|//body//h3|//body//h4|//body//h5|//body//h6|//body//div[not(p)]");
+                        if (nodes != null)
+                        {
+                            node = nodes.FirstOrDefault(n => n.InnerText.Trim() == paragraph.Content.Trim());
+                        }
+                    }
+
+                    if (node != null)
+                    {
+                        // Preserve attributes and surrounding HTML structure
+                        node.InnerHtml = paragraph.TranslatedContent ?? paragraph.Content;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Node not found for content in chapter {ChapterTitle}, falling back to basic template",
+                            chapter.Title);
+                        return BuildBasicChapterContent(chapter);
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    _logger.LogWarning("Node not found at path {NodePath} in chapter {ChapterTitle}",
-                        paragraph.NodePath,
-                        chapter.Title);
+                    _logger.LogError(ex, "Error updating node content in chapter {ChapterTitle}", chapter.Title);
+                    return BuildBasicChapterContent(chapter);
                 }
             }
 

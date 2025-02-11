@@ -33,12 +33,31 @@ public class TranslationMemorySettings
     public bool AutoOptimize { get; set; } = true;
 }
 
+public class ConcurrencySettings
+{
+    public Dictionary<int, ConcurrencyLevel> WordCountThresholds { get; set; } = new()
+    {
+        { 50, new ConcurrencyLevel { Threads = 8, Description = "Very short paragraphs", DelayMs = 100 } },
+        { 100, new ConcurrencyLevel { Threads = 6, Description = "Short paragraphs", DelayMs = 150 } },
+        { 200, new ConcurrencyLevel { Threads = 4, Description = "Medium paragraphs", DelayMs = 200 } },
+        { int.MaxValue, new ConcurrencyLevel { Threads = 2, Description = "Long paragraphs", DelayMs = 250 } }
+    };
+}
+
+public class ConcurrencyLevel
+{
+    public int Threads { get; set; }
+    public string Description { get; set; } = string.Empty;
+    public int DelayMs { get; set; }
+}
+
 public class EpubSettings
 {
     public string OutputDirectory { get; set; } = "output";
     public bool PreserveOriginalFormatting { get; set; } = true;
     public bool IncludeTranslationMetadata { get; set; } = true;
     public bool ValidateOutput { get; set; } = true;
+    public ConcurrencySettings Concurrency { get; set; } = new();
 }
 
 public class LoggingSettings
