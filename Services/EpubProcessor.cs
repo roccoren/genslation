@@ -1,7 +1,13 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.IO.Compression;
+using System.Threading;
+using System.Threading.Tasks;
 using genslation.Configuration;
 using genslation.Interfaces;
 using genslation.Models;
@@ -22,54 +28,43 @@ namespace genslation.Services
             ITranslationProvider translationProvider,
             EpubSettings epubSettings)
         {
-            _logger = logger;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _translationProvider = translationProvider ?? throw new ArgumentNullException(nameof(translationProvider));
             _concurrencySettings = epubSettings?.Concurrency ?? throw new ArgumentNullException(nameof(epubSettings));
         }
 
+        private static int CountWords(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return 0;
+            return text.Split(new[] { ' ', '\t', '\n', '\r' },
+                StringSplitOptions.RemoveEmptyEntries).Length;
+        }
+
         public async Task<EpubDocument> LoadAsync(string filePath)
         {
-            var book = await EpubReader.ReadBookAsync(filePath);
-            return new EpubDocument
+            try
             {
-                Title = book.Title,
-                Author = string.Join("; ", book.AuthorList),
-                Language = book.Schema.Package.Metadata.Languages.FirstOrDefault()?.ToString() ?? string.Empty,
-                FilePath = filePath,
-                Chapters = await LoadChaptersAsync(book)
-            };
+                var book = await EpubReader.ReadBookAsync(filePath);
+                return new EpubDocument
+                {
+                    Title = book.Title,
+                    Author = string.Join("; ", book.AuthorList),
+                    Language = book.Schema.Package.Metadata.Languages.FirstOrDefault()?.ToString() ?? string.Empty,
+                    FilePath = filePath,
+                    Chapters = await LoadChaptersAsync(book)
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load EPUB file: {FilePath}", filePath);
+                throw;
+            }
         }
 
-        public async Task<bool> ValidateStructureAsync(EpubDocument document)
-        {
-            if (document == null)
-            {
-                _logger.LogError("Document is null");
-                return false;
-            }
-
-            if (string.IsNullOrEmpty(document.FilePath) || !File.Exists(document.FilePath))
-            {
-                _logger.LogError("Invalid file path: {FilePath}", document.FilePath);
-                return false;
-            }
-
-            if (!document.Chapters?.Any() ?? true)
-            {
-                _logger.LogError("No chapters found in EPUB document.");
-                return false;
-            }
-
-            return true;
-        }
-
-        public async Task<List<EpubChapter>> ExtractChaptersAsync(EpubDocument document)
-        {
-            var book = await EpubReader.ReadBookAsync(document.FilePath);
-            return await LoadChaptersAsync(book);
-        }
-
-        public async Task<bool> SaveTranslatedEpubAsync(EpubDocument originalDocument, string outputPath, TranslationOptions options)
+        public async Task<bool> SaveTranslatedEpubAsync(
+            EpubDocument originalDocument,
+            string outputPath,
+            TranslationOptions options)
         {
             var tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
@@ -83,24 +78,26 @@ namespace genslation.Services
                     var chapterPath = Path.Combine(tempDir, chapter.OriginalPath);
                     if (!File.Exists(chapterPath)) continue;
 
-                    var translatedContent = await RebuildChapterContentAsync(chapter);
-                    await File.WriteAllTextAsync(chapterPath, translatedContent, new UTF8Encoding(false));
+                    try
+                    {
+                        var translatedContent = await RebuildChapterContentAsync(chapter);
+                        await File.WriteAllTextAsync(chapterPath, translatedContent, Encoding.UTF8);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to process chapter: {ChapterPath}", chapterPath);
+                        return false;
+                    }
                 }
 
                 UpdateContentOpf(tempDir, options.TargetLanguage);
-
-                if (originalDocument.CoverImage != null)
-                {
-                    await File.WriteAllBytesAsync(Path.Combine(tempDir, "cover.jpg"), originalDocument.CoverImage);
-                }
 
                 if (File.Exists(outputPath))
                 {
                     File.Delete(outputPath);
                 }
 
-                CreateEpubArchive(tempDir, outputPath);
-
+                ZipFile.CreateFromDirectory(tempDir, outputPath);
                 return File.Exists(outputPath);
             }
             finally
@@ -110,6 +107,64 @@ namespace genslation.Services
                     Directory.Delete(tempDir, true);
                 }
             }
+        }
+
+        private void UpdateContentOpf(string tempDir, string targetLanguage)
+        {
+            var contentOpfPath = Path.Combine(tempDir, "content.opf");
+            if (!File.Exists(contentOpfPath)) return;
+
+            var content = File.ReadAllText(contentOpfPath, Encoding.UTF8);
+            content = Regex.Replace(content,
+                @"<dc:language>[^<]+</dc:language>",
+                $"<dc:language>{targetLanguage}</dc:language>");
+            File.WriteAllText(contentOpfPath, content, Encoding.UTF8);
+        }
+
+        public async Task<List<EpubChapter>> ExtractChaptersAsync(EpubDocument document)
+        {
+            var book = await EpubReader.ReadBookAsync(document.FilePath);
+            return await LoadChaptersAsync(book);
+        }
+
+        public Task<bool> ValidateStructureAsync(EpubDocument document)
+        {
+            if (document == null)
+            {
+                _logger.LogError("Document is null");
+                return Task.FromResult(false);
+            }
+
+            if (string.IsNullOrEmpty(document.FilePath) || !File.Exists(document.FilePath))
+            {
+                _logger.LogError("Invalid file path: {FilePath}", document.FilePath);
+                return Task.FromResult(false);
+            }
+
+            if (!document.Chapters?.Any() ?? true)
+            {
+                _logger.LogError("No chapters found in EPUB document.");
+                return Task.FromResult(false);
+            }
+
+            return Task.FromResult(true);
+        }
+
+        public Task<bool> ValidateOutputAsync(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath))
+            {
+                _logger.LogError("Output file path is null or empty");
+                return Task.FromResult(false);
+            }
+
+            if (!File.Exists(filePath))
+            {
+                _logger.LogError("Output file does not exist: {FilePath}", filePath);
+                return Task.FromResult(false);
+            }
+
+            return Task.FromResult(true);
         }
 
         public async Task<Dictionary<string, string>> ExtractMetadataAsync(string filePath)
@@ -129,23 +184,6 @@ namespace genslation.Services
                 _logger.LogError(ex, "Failed to extract metadata.");
                 throw;
             }
-        }
-
-        public async Task<bool> ValidateOutputAsync(string filePath)
-        {
-            if (string.IsNullOrEmpty(filePath))
-            {
-                _logger.LogError("Output file path is null or empty");
-                return false;
-            }
-
-            if (!File.Exists(filePath))
-            {
-                _logger.LogError("Output file does not exist: {FilePath}", filePath);
-                return false;
-            }
-
-            return true;
         }
 
         public async Task<byte[]> GeneratePreviewAsync(EpubDocument document, int chapterIndex = 0)
@@ -169,6 +207,47 @@ namespace genslation.Services
             var chapter = document.Chapters[chapterIndex];
             var content = await RebuildChapterContentAsync(chapter);
             return Encoding.UTF8.GetBytes(content);
+        }
+
+        public async Task<EpubDocument> TranslateDocumentAsync(EpubDocument document, string targetLanguage, TranslationOptions options)
+        {
+            if (document == null) throw new ArgumentNullException(nameof(document));
+            if (string.IsNullOrEmpty(targetLanguage)) throw new ArgumentException("Target language cannot be empty", nameof(targetLanguage));
+            if (options == null) throw new ArgumentNullException(nameof(options));
+
+            _logger.LogInformation("Starting document translation to {TargetLanguage}", targetLanguage);
+
+            var failedParagraphs = new ConcurrentBag<(EpubChapter Chapter, EpubParagraph Paragraph, Exception Error)>();
+            var metrics = new ConcurrentDictionary<string, TranslationMetrics>();
+            
+            var rateLimiters = _concurrencySettings.WordCountThresholds.ToDictionary(
+                kvp => kvp.Key,
+                kvp => (
+                    Limiter: new SemaphoreSlim(kvp.Value.Threads),
+                    Description: kvp.Value.Description
+                )
+            );
+
+            foreach (var chapter in document.Chapters)
+            {
+                var batches = await CreateParagraphBatches(chapter.Paragraphs, options.MaxTokensPerRequest);
+                var tasks = batches.Select(async batch =>
+                {
+                    await rateLimiters[batch.Count].Limiter.WaitAsync();
+                    try
+                    {
+                        await ProcessBatch(batch, chapter, document.Language, targetLanguage, options, metrics, failedParagraphs);
+                    }
+                    finally
+                    {
+                        rateLimiters[batch.Count].Limiter.Release();
+                    }
+                });
+
+                await Task.WhenAll(tasks);
+            }
+
+            return document;
         }
 
         private async Task<List<EpubChapter>> LoadChaptersAsync(EpubBook book)
@@ -200,8 +279,6 @@ namespace genslation.Services
 
             foreach (var node in textNodes.Where(n => !string.IsNullOrWhiteSpace(n.InnerText)))
             {
-                if (string.IsNullOrWhiteSpace(node.InnerText)) continue;
-
                 paragraphs.Add(new EpubParagraph
                 {
                     Id = Guid.NewGuid().ToString(),
@@ -213,6 +290,63 @@ namespace genslation.Services
             }
 
             return paragraphs;
+        }
+
+        private async Task<List<List<EpubParagraph>>> CreateParagraphBatches(List<EpubParagraph> paragraphs, int maxTokensPerBatch)
+        {
+            var batches = new List<List<EpubParagraph>>();
+            var currentBatch = new List<EpubParagraph>();
+            var currentTokenCount = 0;
+
+            foreach (var paragraph in paragraphs)
+            {
+                var tokens = await _translationProvider.EstimateTokenCount(paragraph.Content);
+                
+                if (currentTokenCount + tokens > maxTokensPerBatch && currentBatch.Any())
+                {
+                    batches.Add(currentBatch);
+                    currentBatch = new List<EpubParagraph>();
+                    currentTokenCount = 0;
+                }
+
+                currentBatch.Add(paragraph);
+                currentTokenCount += tokens;
+            }
+
+            if (currentBatch.Any())
+            {
+                batches.Add(currentBatch);
+            }
+
+            return batches;
+        }
+
+        private async Task ProcessBatch(
+            List<EpubParagraph> batch,
+            EpubChapter chapter,
+            string sourceLanguage,
+            string targetLanguage,
+            TranslationOptions options,
+            ConcurrentDictionary<string, TranslationMetrics> metrics,
+            ConcurrentBag<(EpubChapter, EpubParagraph, Exception)> failedParagraphs)
+        {
+            foreach (var paragraph in batch)
+            {
+                try
+                {
+                    var translationResult = await _translationProvider.TranslateAsync(
+                        paragraph.Content,
+                        sourceLanguage,
+                        targetLanguage,
+                        options);
+
+                    paragraph.TranslatedContent = translationResult.TranslatedContent;
+                }
+                catch (Exception ex)
+                {
+                    failedParagraphs.Add((chapter, paragraph, ex));
+                }
+            }
         }
 
         private async Task<string> RebuildChapterContentAsync(EpubChapter chapter)
@@ -228,107 +362,26 @@ namespace genslation.Services
             foreach (var paragraph in chapter.Paragraphs)
             {
                 var node = doc.DocumentNode.SelectSingleNode(paragraph.NodePath);
-                if (node == null)
-                {
-                    var nodes = doc.DocumentNode.SelectNodes("//body//p|//body//h1|//body//h2|//body//h3|//body//h4|//body//h5|//body//h6|//body//div[not(p)]");
-                    node = nodes?.FirstOrDefault(n => n.InnerText.Trim() == paragraph.Content.Trim());
-                }
-
                 if (node != null)
                 {
                     node.InnerHtml = paragraph.TranslatedContent ?? paragraph.Content;
                 }
             }
 
-            var result = EnsureProperXhtmlTags(doc.DocumentNode.OuterHtml);
-            return string.IsNullOrEmpty(result) ? BuildBasicChapterContent(chapter) : result;
-        }
-
-        private string EnsureProperXhtmlTags(string content)
-        {
-            var selfClosingTags = new[]
-            {
-                "img", "br", "hr", "input", "link", "meta",
-                "area", "base", "col", "embed", "param",
-                "source", "track", "wbr"
-            };
-
-            foreach (var tag in selfClosingTags)
-            {
-                var pattern = $@"<{tag}([^>]*[^/])>";
-                content = Regex.Replace(content, pattern, m =>
-                {
-                    var attrs = m.Groups[1].Value.Trim();
-                    return $"<{tag}{(attrs.Length > 0 ? " " + attrs : "")} />";
-                });
-            }
-
-            return content;
+            return doc.DocumentNode.OuterHtml;
         }
 
         private string BuildBasicChapterContent(EpubChapter chapter)
         {
             var sb = new StringBuilder();
             sb.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
-            sb.AppendLine("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">");
-            sb.AppendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\">");
-            sb.AppendLine("<head>");
-            sb.AppendLine("  <title>" + System.Security.SecurityElement.Escape(chapter.Title) + "</title>");
-            sb.AppendLine("</head>");
-            sb.AppendLine("<body>");
-
+            sb.AppendLine("<html><body>");
             foreach (var paragraph in chapter.Paragraphs)
             {
-                var content = paragraph.TranslatedContent ?? paragraph.Content;
-                if (!string.IsNullOrWhiteSpace(content))
-                {
-                    sb.AppendLine("  <p>" + System.Security.SecurityElement.Escape(content) + "</p>");
-                }
+                sb.AppendLine($"<p>{paragraph.TranslatedContent ?? paragraph.Content}</p>");
             }
-
-            sb.AppendLine("</body>");
-            sb.AppendLine("</html>");
+            sb.AppendLine("</body></html>");
             return sb.ToString();
-        }
-
-        private void UpdateContentOpf(string tempDir, string targetLanguage)
-        {
-            var contentOpfPath = Path.Combine(tempDir, "content.opf");
-            if (!File.Exists(contentOpfPath)) return;
-
-            var content = File.ReadAllText(contentOpfPath, Encoding.UTF8);
-            content = Regex.Replace(content,
-                @"<dc:language>[^<]+</dc:language>",
-                $"<dc:language>{targetLanguage}</dc:language>");
-            File.WriteAllText(contentOpfPath, content, new UTF8Encoding(false));
-        }
-
-        private void CreateEpubArchive(string sourceDir, string outputPath)
-        {
-            using var zipStream = new FileStream(outputPath, FileMode.Create);
-            using var archive = new ZipArchive(zipStream, ZipArchiveMode.Create);
-
-            // Add mimetype file first, uncompressed
-            var mimetypePath = Path.Combine(sourceDir, "mimetype");
-            if (File.Exists(mimetypePath))
-            {
-                var entry = archive.CreateEntry("mimetype", CompressionLevel.NoCompression);
-                using var entryStream = entry.Open();
-                using var fileStream = File.OpenRead(mimetypePath);
-                fileStream.CopyTo(entryStream);
-            }
-
-            // Add all other files
-            foreach (var file in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
-            {
-                if (Path.GetFileName(file) == "mimetype") continue;
-
-                var relativePath = Path.GetRelativePath(sourceDir, file).Replace("\\", "/");
-                var entry = archive.CreateEntry(relativePath, CompressionLevel.Optimal);
-                using var entryStream = entry.Open();
-                using var fileStream = File.OpenRead(file);
-                fileStream.CopyTo(entryStream);
-            }
         }
     }
 }
