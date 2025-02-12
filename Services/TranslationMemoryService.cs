@@ -5,14 +5,12 @@ using System.Text.Json;
 using genslation.Interfaces;
 using genslation.Models;
 using Microsoft.Extensions.Logging;
-using F23.StringSimilarity;
 
 public class TranslationMemoryService : ITranslationMemoryService
 {
     private readonly ILogger<TranslationMemoryService> _logger;
     private readonly string _storageDirectory;
     private readonly ConcurrentDictionary<string, TranslationMemoryEntry> _memoryCache;
-    private readonly NormalizedLevenshtein _similarityAlgorithm;
     private readonly SemaphoreSlim _semaphore;
 
     public TranslationMemoryService(
@@ -24,7 +22,6 @@ public class TranslationMemoryService : ITranslationMemoryService
             Path.GetDirectoryName(typeof(TranslationMemoryService).Assembly.Location) ?? ".",
             storageDirectory);
         _memoryCache = new ConcurrentDictionary<string, TranslationMemoryEntry>();
-        _similarityAlgorithm = new NormalizedLevenshtein();
         _semaphore = new SemaphoreSlim(1, 1);
 
         Directory.CreateDirectory(_storageDirectory);
@@ -67,7 +64,7 @@ public class TranslationMemoryService : ITranslationMemoryService
             .Select(e => new
             {
                 Entry = e,
-                Similarity = _similarityAlgorithm.Similarity(sourceText, e.SourceText)
+                Similarity = CalculateSimilarity(sourceText, e.SourceText)
             })
             .Where(x => x.Similarity >= 0.8)
             .OrderByDescending(x => x.Similarity)
@@ -172,7 +169,7 @@ public class TranslationMemoryService : ITranslationMemoryService
 
     public async Task<double> CalculateSimilarityAsync(string text1, string text2)
     {
-        return _similarityAlgorithm.Similarity(text1, text2);
+        return CalculateSimilarity(text1, text2);
     }
 
     public async Task<bool> DeleteEntryAsync(string sourceText, string sourceLanguage, string targetLanguage)
@@ -285,5 +282,32 @@ public class TranslationMemoryService : ITranslationMemoryService
         {
             _logger.LogError(ex, "Failed to save translation memory to disk");
         }
+    }
+
+    private double CalculateSimilarity(string text1, string text2)
+    {
+        int distance = LevenshteinDistance(text1, text2);
+        return 1.0 - (double)distance / Math.Max(text1.Length, text2.Length);
+    }
+
+    private int LevenshteinDistance(string s, string t)
+    {
+        int[,] d = new int[s.Length + 1, t.Length + 1];
+
+        for (int i = 0; i <= s.Length; i++) d[i, 0] = i;
+        for (int j = 0; j <= t.Length; j++) d[0, j] = j;
+
+        for (int i = 1; i <= s.Length; i++)
+        {
+            for (int j = 1; j <= t.Length; j++)
+            {
+                int cost = s[i - 1] == t[j - 1] ? 0 : 1;
+                d[i, j] = Math.Min(
+                    Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
+                    d[i - 1, j - 1] + cost);
+            }
+        }
+
+        return d[s.Length, t.Length];
     }
 }
